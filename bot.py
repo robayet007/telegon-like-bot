@@ -7,6 +7,7 @@ from telethon.errors import SessionPasswordNeededError
 from telethon.sessions import StringSession
 from dotenv import load_dotenv
 import aiohttp
+from aiohttp import web
 
 # Load environment variables
 load_dotenv()
@@ -478,10 +479,10 @@ async def alllimit_command_handler(event):
 
 
 async def main():
-    """Main function to start the bot"""
+    """Main function to start the bot and a minimal web server (for Render Web Service)."""
     print("🚀 Starting Free Fire Like Bot...")
 
-    # Start the client
+    # Start the Telegram client
     await client.start()
 
     # SESSION_STRING না থাকলে শুধু তখনই ফোন/কোড চাইবে (লোকাল চালানোর সময়)
@@ -498,6 +499,23 @@ async def main():
                 password = input("Enter your 2FA password: ")
                 await client.sign_in(password=password)
 
+    # ----------------------
+    # Minimal HTTP server (for Render Web Service port binding)
+    # ----------------------
+    async def health(request):
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    port = int(os.getenv("PORT", 8000))  # Render will set PORT
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    print(f"🌐 HTTP server running on port {port}")
     print("✅ Bot is running! Send /start to begin.")
     print("Press Ctrl+C to stop.")
 
