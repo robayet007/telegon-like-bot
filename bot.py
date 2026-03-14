@@ -4,6 +4,7 @@ import re
 from datetime import datetime
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
+from telethon.sessions import StringSession
 from dotenv import load_dotenv
 import aiohttp
 
@@ -14,9 +15,15 @@ load_dotenv()
 API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
 API_KEY = os.getenv('API_KEY', 'BSMQ9T')  # Default API key
+SESSION_STRING = os.getenv('SESSION_STRING')
 
 # Create Telegram client
-client = TelegramClient('ff_like_bot', API_ID, API_HASH)
+if SESSION_STRING:
+    # Render/Vercel এর মত environment এ SESSION_STRING থাকলে ওটাই use করবে
+    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+else:
+    # লোকাল রান করার সময় পুরনো file-session ('ff_like_bot.session') use করবে
+    client = TelegramClient('ff_like_bot', API_ID, API_HASH)
 
 # =========================
 # In-memory LIMIT SYSTEM
@@ -99,12 +106,12 @@ def format_response(data):
     likes_after = data.get('LikesafterCommand', 0)
     player_nickname = data.get('PlayerNickname', 'N/A')
     uid = data.get('UID', 'N/A')
-    
+
     # Calculate total likes added
     total_likes_added = likes_after - likes_before
     if total_likes_added <= 0:
         total_likes_added = likes_given
-    
+
     # Build simple formatted message
     message = f"""✅ **LIKE SENT SUCCESSFULLY**
 ━━━━━━━━━━━━━━━━━━━━
@@ -115,7 +122,7 @@ def format_response(data):
 🔥 After Likes: {likes_after}
 💎 Total Likes Added: {total_likes_added}
 ━━━━━━━━━━━━━━━━━━━━"""
-    
+
     return message
 
 
@@ -137,7 +144,7 @@ def get_likes_added(data) -> int:
 async def call_ff_api(uid):
     """Make GET request to FF API"""
     url = f"https://ff.api.emonaxc.com/like?key={API_KEY}&uid={uid}"
-    
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
@@ -173,19 +180,19 @@ async def like_command_handler(event):
     if not match:
         await event.reply("❌ Invalid format. Use: `/like <uid>`")
         return
-    
+
     uid = match.group(1)
-    
+
     # Send processing message
     try:
         processing_msg = await event.reply(f"⏳ Processing like request for UID: {uid}...")
     except Exception as e:
         print(f"Error replying: {e}")
         return
-    
+
     # Call API
     result = await call_ff_api(uid)
-    
+
     # Handle response
     if result.get('error'):
         try:
@@ -213,11 +220,12 @@ async def like_command_handler(event):
         except:
             await event.reply(formatted_message)
 
+
 @client.on(events.NewMessage(pattern=r'(?i)^/?start$'))
 async def start_command_handler(event):
     """Handle start command - works in both groups and private (with or without /)"""
     is_group = not event.is_private
-    
+
     if is_group:
         help_message = """🤖 **Free Fire Like Bot**
 
@@ -242,7 +250,7 @@ Send likes to Free Fire players using their UID.
 `/like 1711537287`
 
 **Note:** This bot uses your Telegram account to send commands."""
-    
+
     await event.reply(help_message)
 
 
@@ -276,7 +284,7 @@ async def help_command_handler(event):
     # ---------- Admin / Owner Commands ----------
     # Note: এগুলো শুধু bot owner (যে account দিয়ে bot চালাচ্ছেন) use করতে পারবে
     admin_cmds = """
-
+    
 🛠 **Admin / Owner Commands**
 
 - `setlimit <n>` / `/setlimit <n>`  
@@ -306,7 +314,6 @@ async def help_command_handler(event):
 - Slash (`/`) সহ বা ছাড়া – দু’ভাবেই command দেওয়া যাবে
 - Valid UID numeric হতে হবে
 """
-
     await event.reply(help_message)
 
 
@@ -473,26 +480,27 @@ async def alllimit_command_handler(event):
 async def main():
     """Main function to start the bot"""
     print("🚀 Starting Free Fire Like Bot...")
-    
+
     # Start the client
     await client.start()
-    
-    # Check if we need to authenticate
-    if not await client.is_user_authorized():
-        print("📱 Please authorize this session:")
-        phone = input("Enter your phone number: ")
-        await client.send_code_request(phone)
-        
-        try:
-            code = input("Enter the code you received: ")
-            await client.sign_in(phone, code)
-        except SessionPasswordNeededError:
-            password = input("Enter your 2FA password: ")
-            await client.sign_in(password=password)
-    
+
+    # SESSION_STRING না থাকলে শুধু তখনই ফোন/কোড চাইবে (লোকাল চালানোর সময়)
+    if not SESSION_STRING:
+        if not await client.is_user_authorized():
+            print("📱 Please authorize this session:")
+            phone = input("Enter your phone number: ")
+            await client.send_code_request(phone)
+
+            try:
+                code = input("Enter the code you received: ")
+                await client.sign_in(phone, code)
+            except SessionPasswordNeededError:
+                password = input("Enter your 2FA password: ")
+                await client.sign_in(password=password)
+
     print("✅ Bot is running! Send /start to begin.")
     print("Press Ctrl+C to stop.")
-    
+
     # Keep the bot running
     await client.run_until_disconnected()
 
@@ -504,4 +512,3 @@ if __name__ == '__main__':
         print("\n👋 Bot stopped by user")
     except Exception as e:
         print(f"❌ Error: {e}")
-
