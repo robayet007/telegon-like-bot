@@ -30,73 +30,73 @@ else:
 # In-memory LIMIT SYSTEM
 # =========================
 
-# Default daily limit per user (if not overridden)
+# Default monthly limit per user (if not overridden)
 # 0 মানে: ডিফল্টভাবে কেউই request পাঠাতে পারবে না,
 # admin যখন limit সেট করবে তখন থেকেই সেই user use করতে পারবে।
-DEFAULT_DAILY_LIMIT = 0
+DEFAULT_MONTHLY_LIMIT = 0
 
 # Per-user custom limits: user_id -> limit
 USER_LIMITS = {}
 
-# Daily usage: (user_id, date_str) -> count
+# Monthly usage: (user_id, month_str) -> count
 USER_USAGE = {}
 
 
-def _today_str():
-    """Return today's date as YYYY-MM-DD in UTC."""
-    return datetime.utcnow().strftime('%Y-%m-%d')
+def _this_month_str():
+    """Return current month as YYYY-MM in UTC."""
+    return datetime.utcnow().strftime('%Y-%m')
 
 
 def _usage_key(user_id: int) -> tuple:
-    """Build usage dict key for a user for today."""
-    return (user_id, _today_str())
+    """Build usage dict key for a user for this month."""
+    return (user_id, _this_month_str())
 
 
 async def check_limit(event) -> bool:
     """
-    Check if user still has quota today.
+    Check if user still has quota this month.
     NOTE: This does NOT increment usage. Increment only on success.
     """
     user_id = event.sender_id
     key = _usage_key(user_id)
 
     # Get user's custom limit or default
-    limit = USER_LIMITS.get(user_id, DEFAULT_DAILY_LIMIT)
+    limit = USER_LIMITS.get(user_id, DEFAULT_MONTHLY_LIMIT)
     count = USER_USAGE.get(key, 0)
 
     if count >= limit:
         await event.reply(
-            f"⚠️ আজকের limit শেষ হয়ে গেছে!\n\n"
+            f"⚠️ এই মাসের limit শেষ হয়ে গেছে!\n\n"
             f"👤 User ID: `{user_id}`\n"
-            f"📅 Date: `{_today_str()}`\n"
-            f"📌 Daily limit: `{limit}` request"
+            f"📅 Month: `{_this_month_str()}`\n"
+            f"📌 Monthly limit: `{limit}` request"
         )
         return False
     return True
 
 
 def increment_usage_for_user(user_id: int):
-    """Increment today's usage counter for a specific user."""
+    """Increment this month's usage counter for a specific user."""
     key = _usage_key(user_id)
     USER_USAGE[key] = USER_USAGE.get(key, 0) + 1
 
 
-async def reset_today_usage_for_user(event, target_user_id: int):
-    """Reset today's usage counter for a specific user."""
+async def reset_monthly_usage_for_user(event, target_user_id: int):
+    """Reset this month's usage counter for a specific user."""
     key = _usage_key(target_user_id)
     if key in USER_USAGE:
         del USER_USAGE[key]
     await event.reply(
-        f"✅ Today's usage reset for user `{target_user_id}` "
-        f"on `{_today_str()}`"
+        f"✅ This month's usage reset for user `{target_user_id}` "
+        f"for month `{_this_month_str()}`"
     )
 
 
 async def set_limit_for_user(event, target_user_id: int, limit: int):
-    """Set custom daily limit for a specific user."""
+    """Set custom monthly limit for a specific user."""
     USER_LIMITS[target_user_id] = limit
     await event.reply(
-        f"✅ Daily limit set to `{limit}` for user `{target_user_id}`"
+        f"✅ Monthly limit set to `{limit}` for user `{target_user_id}`"
     )
 
 
@@ -172,7 +172,7 @@ async def call_ff_api(uid):
 @client.on(events.NewMessage(pattern=r'(?i)^/?like\s+(\d+)$'))
 async def like_command_handler(event):
     """Handle like <uid> command - works in both groups and private, with or without /"""
-    # Check daily limit for this user (increment only on success)
+    # Check monthly limit for this user (increment only on success)
     if not await check_limit(event):
         return
 
@@ -259,6 +259,10 @@ Send likes to Free Fire players using their UID.
 async def help_command_handler(event):
     """Handle help command - works in both groups and private (with or without /)"""
     is_group = not event.is_private
+    
+    # Check if user is owner/admin
+    me = await client.get_me()
+    is_owner = event.sender_id == me.id
 
     # ---------- User Commands ----------
     if is_group:
@@ -267,7 +271,7 @@ async def help_command_handler(event):
 - `like <uid>` – Free Fire UID-এ like পাঠাবে
 - `start` – Bot সম্পর্কে basic তথ্য দেখাবে
 - `help` – এই help message দেখাবে
-- `mylimit` – আজকে কতবার use করেছেন ও আপনার daily limit কত তা দেখাবে
+- `mylimit` – এই মাসে কতবার use করেছেন ও আপনার monthly limit কত তা দেখাবে
 
 **Example:**
 `like 1711537287`"""
@@ -277,7 +281,7 @@ async def help_command_handler(event):
 - `like <uid>` / `/like <uid>` – Free Fire UID-এ like পাঠাবে
 - `start` / `/start` – Bot সম্পর্কে basic তথ্য
 - `help` / `/help` – এই help message
-- `mylimit` / `/mylimit` – আজকের ব্যবহার ও limit দেখাবে
+- `mylimit` / `/mylimit` – এই মাসের ব্যবহার ও monthly limit দেখাবে
 
 **Example:**
 `like 1711537287`"""
@@ -289,26 +293,38 @@ async def help_command_handler(event):
 🛠 **Admin / Owner Commands**
 
 - `setlimit <n>` / `/setlimit <n>`  
-  ➤ নিজের daily limit `n` সেট করবে  
+  ➤ নিজের monthly limit `n` সেট করবে  
   উদাহরণ: `setlimit 10`
 
 - `setlimit <n> @username`  
-  ➤ নির্দিষ্ট user-এর daily limit সেট করবে  
+  ➤ নির্দিষ্ট user-এর monthly limit সেট করবে  
   উদাহরণ: `setlimit 5 @testuser`
 
 - `resetlimit` / `/resetlimit`  
-  ➤ নিজের আজকের usage reset করবে
+  ➤ নিজের এই মাসের usage reset করবে
 
 - `resetlimit @username`  
-  ➤ ঐ user-এর আজকের usage reset করবে
+  ➤ ঐ user-এর এই মাসের usage reset করবে
 
 - `alllimit` / `/alllimit`  
-  ➤ আজকের জন্য সব user-এর used / limit / remaining list দেখাবে (owner only)
+  ➤ এই মাসের জন্য সব user-এর used / limit / remaining list দেখাবে (owner only)
 """
 
-    help_message = f"""📖 **Help**
+    # Owner হলে full help, regular user হলে শুধু user commands
+    if is_owner:
+        help_message = f"""📖 **Help**
 
 {user_cmds}{admin_cmds}
+
+⚙️ **Note:**
+- Commands case-insensitive: `like`, `Like`, `LIKE` সব কাজ করবে
+- Slash (`/`) সহ বা ছাড়া – দু’ভাবেই command দেওয়া যাবে
+- Valid UID numeric হতে হবে
+"""
+    else:
+        help_message = f"""📖 **Help**
+
+{user_cmds}
 
 ⚙️ **Note:**
 - Commands case-insensitive: `like`, `Like`, `LIKE` সব কাজ করবে
@@ -326,10 +342,10 @@ async def help_command_handler(event):
 @client.on(events.NewMessage(pattern=r'(?i)^/?setlimit\s+(\d+)(?:\s+(@?\w+))?$'))
 async def setlimit_command_handler(event):
     """
-    Set daily limit for a user.
+    Set monthly limit for a user.
     Usage:
-      /setlimit 5           -> set your own daily limit to 5
-      /setlimit 5 @username -> set limit for @username
+      /setlimit 5           -> set your own monthly limit to 5
+      /setlimit 5 @username -> set monthly limit for @username
     """
     # Only allow owner (self account) to change limits
     me = await client.get_me()
@@ -363,10 +379,10 @@ async def setlimit_command_handler(event):
 @client.on(events.NewMessage(pattern=r'(?i)^/?resetlimit(?:\s+(@?\w+))?$'))
 async def resetlimit_command_handler(event):
     """
-    Reset today's usage counter for a user.
+    Reset this month's usage counter for a user.
     Usage:
-      /resetlimit           -> reset your own usage for today
-      /resetlimit @username -> reset usage for @username today
+      /resetlimit           -> reset your own usage for this month
+      /resetlimit @username -> reset usage for @username this month
     """
     # Only allow owner to reset limits
     me = await client.get_me()
@@ -393,26 +409,26 @@ async def resetlimit_command_handler(event):
     else:
         target_user_id = event.sender_id
 
-    await reset_today_usage_for_user(event, target_user_id)
+    await reset_monthly_usage_for_user(event, target_user_id)
 
 
 @client.on(events.NewMessage(pattern=r'(?i)^/?mylimit$'))
 async def mylimit_command_handler(event):
     """
-    Show current limit and today's usage for the caller.
+    Show current limit and this month's usage for the caller.
     Usage: /mylimit
     """
     user_id = event.sender_id
     key = _usage_key(user_id)
-    limit = USER_LIMITS.get(user_id, DEFAULT_DAILY_LIMIT)
+    limit = USER_LIMITS.get(user_id, DEFAULT_MONTHLY_LIMIT)
     used = USER_USAGE.get(key, 0)
 
     await event.reply(
         f"📊 **Your Limit Status**\n\n"
         f"👤 User ID: `{user_id}`\n"
-        f"📅 Date: `{_today_str()}`\n"
+        f"📅 Month: `{_this_month_str()}`\n"
         f"✅ Used: `{used}` request(s)\n"
-        f"📌 Daily Limit: `{limit}` request(s)\n"
+        f"📌 Monthly Limit: `{limit}` request(s)\n"
         f"🔄 Remaining: `{max(limit - used, 0)}` request(s)"
     )
 
@@ -420,7 +436,7 @@ async def mylimit_command_handler(event):
 @client.on(events.NewMessage(pattern=r'(?i)^/?alllimit$'))
 async def alllimit_command_handler(event):
     """
-    Show today's usage & limits for all users (owner only).
+    Show this month's usage & limits for all users (owner only).
     Usage: alllimit / /alllimit
     """
     # Only owner can see full list
@@ -429,19 +445,19 @@ async def alllimit_command_handler(event):
         await event.reply("❌ Only the bot owner can use `alllimit`.")
         return
 
-    today = _today_str()
+    this_month = _this_month_str()
 
     # Collect all user_ids from limits and usage
     user_ids = set(USER_LIMITS.keys())
-    for (uid, date_str), _ in USER_USAGE.items():
-        if date_str == today:
+    for (uid, month_str), _ in USER_USAGE.items():
+        if month_str == this_month:
             user_ids.add(uid)
 
     if not user_ids:
-        await event.reply("📊 আজকে এখনও কেউ কোনো request পাঠায়নি।")
+        await event.reply("📊 এই মাসে এখনও কেউ কোনো request পাঠায়নি।")
         return
 
-    lines = [f"📊 **All Users Limit Status**\n📅 Date: `{today}`\n"]
+    lines = [f"📊 **All Users Limit Status**\n📅 Month: `{this_month}`\n"]
 
     # Pre-fetch entities for better names (best-effort)
     name_cache = {}
@@ -462,8 +478,8 @@ async def alllimit_command_handler(event):
             name_cache[uid] = str(uid)
 
     for uid in sorted(user_ids):
-        key = (uid, today)
-        limit = USER_LIMITS.get(uid, DEFAULT_DAILY_LIMIT)
+        key = (uid, this_month)
+        limit = USER_LIMITS.get(uid, DEFAULT_MONTHLY_LIMIT)
         used = USER_USAGE.get(key, 0)
         remaining = max(limit - used, 0)
         display_name = name_cache.get(uid, str(uid))
