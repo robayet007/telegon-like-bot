@@ -3,6 +3,7 @@ import asyncio
 import re
 import json
 from datetime import datetime
+from pathlib import Path
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from telethon import TelegramClient, events
@@ -52,10 +53,16 @@ USER_LIMITS = {}
 # Monthly usage: (user_id, month_str, like_type) -> count
 USER_USAGE = {}
 
+# Recent successful like activity for dashboard
+REQUEST_ACTIVITY = []
+
+# Hierarchy ownership: child_user_id -> manager_user_id
+USER_MANAGERS = {}
+
 # Extra admins promoted by the owner: user_id set
 ADMIN_USERS = set()
 
-# Super admins can do everything admins can, including creating admins/super admins
+# Super admins can create admins inside their own branch
 SUPER_ADMIN_USERS = set()
 
 # Pending super admin verification: user_id -> invited_by_user_id
@@ -67,6 +74,7 @@ SUPER_ADMIN_CREDENTIALS = {}
 mongo_client = None
 mongo_db = None
 state_collection = None
+DASHBOARD_DIR = Path(__file__).resolve().parent
 
 
 def init_mongodb():
@@ -88,7 +96,8 @@ def init_mongodb():
 
 def load_state():
     """Load persistent bot state from MongoDB."""
-    global USER_LIMITS, USER_USAGE, ADMIN_USERS, SUPER_ADMIN_USERS, PENDING_SUPER_ADMINS, SUPER_ADMIN_CREDENTIALS
+    global USER_LIMITS, USER_USAGE, USER_MANAGERS, ADMIN_USERS, SUPER_ADMIN_USERS
+    global PENDING_SUPER_ADMINS, SUPER_ADMIN_CREDENTIALS, REQUEST_ACTIVITY
 
     if state_collection is None:
         return
@@ -105,6 +114,11 @@ def load_state():
         USER_USAGE = {
             (int(item['user_id']), item['month'], int(item['like_type'])): int(item['count'])
             for item in data.get('user_usage', [])
+        }
+        REQUEST_ACTIVITY = list(data.get('request_activity', []))
+        USER_MANAGERS = {
+            int(user_id): int(manager_id)
+            for user_id, manager_id in data.get('user_managers', {}).items()
         }
         ADMIN_USERS = set(int(user_id) for user_id in data.get('admin_users', []))
         SUPER_ADMIN_USERS = set(int(user_id) for user_id in data.get('super_admin_users', []))
@@ -138,6 +152,10 @@ def save_state():
                 str(user_id): {str(k): v for k, v in limits.items()}
                 for user_id, limits in USER_LIMITS.items()
             },
+            'user_managers': {
+                str(user_id): manager_id
+                for user_id, manager_id in USER_MANAGERS.items()
+            },
             'user_usage': [
                 {
                     'user_id': user_id,
@@ -147,6 +165,7 @@ def save_state():
                 }
                 for (user_id, month, like_type), count in USER_USAGE.items()
             ],
+            'request_activity': REQUEST_ACTIVITY[-200:],
             'admin_users': sorted(ADMIN_USERS),
             'super_admin_users': sorted(SUPER_ADMIN_USERS),
             'pending_super_admins': {
@@ -169,6 +188,11 @@ def _this_month_str():
     return datetime.utcnow().strftime('%Y-%m')
 
 
+def _utc_timestamp_str():
+    """Return UTC timestamp for activity history."""
+    return datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+
+
 def _usage_key(user_id: int, like_type: int) -> tuple:
     """Build usage dict key for a user, current month, and like type."""
     return (user_id, _this_month_str(), like_type)
@@ -178,6 +202,87 @@ def get_user_limit(user_id: int, like_type: int) -> int:
     """Get a user's configured limit for a specific like type."""
     limits = USER_LIMITS.get(user_id, {})
     return limits.get(like_type, DEFAULT_MONTHLY_LIMIT)
+
+
+def get_manager_id(user_id: int) -> int | None:
+    """Return direct manager id for a user if assigned."""
+    return USER_MANAGERS.get(user_id)
+
+
+def set_manager_for_user(target_user_id: int, manager_user_id: int | None):
+    """Assign or clear a user's direct manager."""
+    if manager_user_id is None:
+        USER_MANAGERS.pop(target_user_id, None)
+    else:
+        USER_MANAGERS[target_user_id] = manager_user_id
+
+
+def get_direct_children(manager_user_id: int) -> set[int]:
+    """Return direct child users managed by a specific account."""
+    return {
+        user_id
+        for user_id, parent_id in USER_MANAGERS.items()
+        if parent_id == manager_user_id
+    }
+
+
+def get_descendant_user_ids(manager_user_id: int) -> set[int]:
+    """Return all users nested below a specific manager."""
+    descendants = set()
+    queue = list(get_direct_children(manager_user_id))
+
+    while queue:
+        user_id = queue.pop(0)
+        if user_id in descendants:
+            continue
+        descendants.add(user_id)
+        queue.extend(get_direct_children(user_id))
+
+    return descendants
+
+
+def is_managed_by(manager_user_id: int, target_user_id: int) -> bool:
+    """Return True if target exists inside manager's hierarchy."""
+    current_user_id = get_manager_id(target_user_id)
+    visited = set()
+
+    while current_user_id is not None and current_user_id not in visited:
+        if current_user_id == manager_user_id:
+            return True
+        visited.add(current_user_id)
+        current_user_id = get_manager_id(current_user_id)
+
+    return False
+
+
+def get_direct_child_limit_sum(manager_user_id: int, like_type: int, exclude_user_id: int | None = None) -> int:
+    """Return total limit assigned to direct children for one package."""
+    total = 0
+    for child_user_id in get_direct_children(manager_user_id):
+        if exclude_user_id is not None and child_user_id == exclude_user_id:
+            continue
+        total += get_user_limit(child_user_id, like_type)
+    return total
+
+
+def get_user_used_count(user_id: int, like_type: int) -> int:
+    """Return current month's usage count for a user and package."""
+    return USER_USAGE.get(_usage_key(user_id, like_type), 0)
+
+
+def get_available_self_usage_limit(user_id: int, like_type: int) -> int:
+    """Return how much of a manager's assigned pool is still available for self-use."""
+    own_limit = get_user_limit(user_id, like_type)
+    distributed = get_direct_child_limit_sum(user_id, like_type)
+    return max(own_limit - distributed, 0)
+
+
+def get_remaining_distributable_limit(manager_user_id: int, like_type: int) -> int:
+    """Return how much of the manager's own quota is still free to distribute."""
+    own_limit = get_user_limit(manager_user_id, like_type)
+    own_used = get_user_used_count(manager_user_id, like_type)
+    distributed = get_direct_child_limit_sum(manager_user_id, like_type)
+    return max(own_limit - own_used - distributed, 0)
 
 
 async def get_sender_identity(event):
@@ -194,6 +299,27 @@ async def get_sender_identity(event):
         pass
 
     return sender_id, sender_username.lower() if sender_username else None
+
+
+async def get_sender_display_name(event) -> str:
+    """Resolve a readable sender display name."""
+    try:
+        sender = await event.get_sender()
+        if sender is not None:
+            username = getattr(sender, 'username', None)
+            if username:
+                return f"@{username}"
+
+            first = getattr(sender, 'first_name', '') or ''
+            last = getattr(sender, 'last_name', '') or ''
+            full_name = (first + ' ' + last).strip()
+            if full_name:
+                return full_name
+    except Exception:
+        pass
+
+    sender_id, sender_username = await get_sender_identity(event)
+    return f"@{sender_username}" if sender_username else str(sender_id)
 
 
 def get_event_client(event):
@@ -260,6 +386,39 @@ async def get_access_role(event) -> str:
     return "User"
 
 
+async def can_create_super_admin(event) -> bool:
+    """Only the main owner can create super admins."""
+    return await is_owner(event)
+
+
+async def can_create_admin(event) -> bool:
+    """Owner and super admins can create normal admins."""
+    return await is_super_admin(event)
+
+
+async def can_manage_target_user(event, target_user_id: int, allow_self: bool = False) -> bool:
+    """Check whether the sender can manage the target based on hierarchy."""
+    actor_user_id, _ = await get_sender_identity(event)
+
+    if allow_self and actor_user_id == target_user_id:
+        return True
+
+    if await is_owner(event):
+        return True
+
+    if await is_super_admin(event):
+        if target_user_id in SUPER_ADMIN_USERS:
+            return False
+        return is_managed_by(actor_user_id, target_user_id)
+
+    if await is_admin(event):
+        if target_user_id in ADMIN_USERS or target_user_id in SUPER_ADMIN_USERS:
+            return False
+        return is_managed_by(actor_user_id, target_user_id)
+
+    return False
+
+
 async def build_access_denied_message(event, required_role: str, command_name: str) -> str:
     """Build a detailed permission error for easier debugging."""
     sender_id, sender_username = await get_sender_identity(event)
@@ -271,7 +430,7 @@ async def build_access_denied_message(event, required_role: str, command_name: s
         f"Detected Role: `{role}`\n"
         f"Sender ID: `{sender_id}`\n"
         f"Username: `{('@' + sender_username) if sender_username else 'N/A'}`\n\n"
-        "If this should be a super admin account, run `myaccess` first."
+        "If this should be a managed admin account, run `myaccess` first."
     )
 
 
@@ -288,11 +447,26 @@ async def log_access_check(event, command_name: str):
 
 async def set_admin_for_user(event, target_user_id: int):
     """Promote a user to admin."""
+    manager_user_id, _ = await get_sender_identity(event)
+    existing_manager_id = get_manager_id(target_user_id)
+
+    if target_user_id in SUPER_ADMIN_USERS:
+        await event.reply(f"❌ User `{target_user_id}` is already a super admin.")
+        return
+
+    if existing_manager_id is not None and existing_manager_id != manager_user_id:
+        await event.reply(
+            f"❌ User `{target_user_id}` already belongs to manager `{existing_manager_id}`."
+        )
+        return
+
     ADMIN_USERS.add(target_user_id)
+    set_manager_for_user(target_user_id, manager_user_id)
     save_state()
     await event.reply(
         f"✅ Admin access granted to user `{target_user_id}`\n"
-        "They can now use: `setlimit`, `resetlimit`, `alllimit`, and `mylimit`."
+        f"👤 Managed by: `{manager_user_id}`\n"
+        "They can now manage only their own assigned users."
     )
 
 
@@ -304,18 +478,35 @@ async def remove_admin_for_user(event, target_user_id: int):
         )
         return
 
+    if not await can_manage_target_user(event, target_user_id):
+        await event.reply(f"❌ You cannot remove admin `{target_user_id}` from outside your branch.")
+        return
+
     if target_user_id not in ADMIN_USERS:
         await event.reply(f"❌ User `{target_user_id}` is not a normal admin.")
         return
 
+    actor_user_id, _ = await get_sender_identity(event)
+    for child_user_id in list(get_direct_children(target_user_id)):
+        set_manager_for_user(child_user_id, actor_user_id)
+
     ADMIN_USERS.discard(target_user_id)
+    set_manager_for_user(target_user_id, None)
     save_state()
     await event.reply(f"✅ Admin access removed for user `{target_user_id}`")
 
 
 async def start_super_admin_verification(event, target_user_id: int):
     """Start super admin verification flow for a user."""
+    existing_manager_id = get_manager_id(target_user_id)
+    if existing_manager_id is not None and existing_manager_id != event.sender_id:
+        await event.reply(
+            f"❌ User `{target_user_id}` already belongs to manager `{existing_manager_id}`."
+        )
+        return
+
     PENDING_SUPER_ADMINS[target_user_id] = event.sender_id
+    set_manager_for_user(target_user_id, event.sender_id)
     save_state()
     await event.reply(
         f"✅ Super admin request started for user `{target_user_id}`\n"
@@ -374,7 +565,7 @@ async def approve_super_admin(event, api_id: int, api_hash: str, session_string:
     await event.reply(
         "✅ Super admin verification successful.\n"
         f"Verified account: `{verified_label}`\n"
-        "You can now use all admin commands and also `setadmin` / `setsuperadmin`."
+        "You can now use branch admin commands and `setadmin` for your own branch."
     )
 
 
@@ -386,8 +577,13 @@ async def check_limit(event, like_type: int) -> bool:
     user_id = event.sender_id
     key = _usage_key(user_id, like_type)
 
-    # Get user's custom limit or default
-    limit = get_user_limit(user_id, like_type)
+    # For super admins/admins, self-use comes from the same assigned pool
+    # that they also distribute to child users.
+    if user_id in ADMIN_USERS or user_id in SUPER_ADMIN_USERS:
+        limit = get_available_self_usage_limit(user_id, like_type)
+    else:
+        limit = get_user_limit(user_id, like_type)
+
     count = USER_USAGE.get(key, 0)
 
     if count >= limit:
@@ -409,8 +605,34 @@ def increment_usage_for_user(user_id: int, like_type: int):
     save_state()
 
 
+async def record_like_activity(event, uid: str, like_type: int, likes_added: int):
+    """Store successful like activity for dashboard reporting."""
+    actor_id, actor_username = await get_sender_identity(event)
+    actor_role = await get_access_role(event)
+    actor_name = await get_sender_display_name(event)
+
+    REQUEST_ACTIVITY.append({
+        'at': _utc_timestamp_str(),
+        'month': _this_month_str(),
+        'actor_id': actor_id,
+        'actor_username': actor_username,
+        'actor_name': actor_name,
+        'actor_role': actor_role,
+        'manager_id': get_manager_id(actor_id),
+        'uid': str(uid),
+        'packageType': int(like_type),
+        'likesAdded': int(likes_added),
+    })
+    del REQUEST_ACTIVITY[:-200]
+    save_state()
+
+
 async def reset_monthly_usage_for_user(event, target_user_id: int):
     """Reset this month's usage counter for a specific user for all like types."""
+    if not await can_manage_target_user(event, target_user_id, allow_self=True):
+        await event.reply("❌ You can only reset usage for your own branch.")
+        return
+
     for like_type in LIKE_TYPES:
         key = _usage_key(target_user_id, like_type)
         if key in USER_USAGE:
@@ -424,6 +646,52 @@ async def reset_monthly_usage_for_user(event, target_user_id: int):
 
 async def set_limit_for_user(event, target_user_id: int, limit: int, like_type: int):
     """Set custom monthly limit for a specific user and like type."""
+    actor_user_id, _ = await get_sender_identity(event)
+    actor_is_owner = await is_owner(event)
+    actor_is_super_admin = await is_super_admin(event)
+    actor_is_admin = await is_admin(event)
+
+    if not actor_is_owner:
+        if target_user_id == actor_user_id:
+            await event.reply("❌ You cannot set your own limit. Your parent admin must set it.")
+            return
+
+        if target_user_id in SUPER_ADMIN_USERS:
+            await event.reply("❌ You cannot change another super admin's limit.")
+            return
+
+        if actor_is_admin and not actor_is_super_admin and target_user_id in ADMIN_USERS:
+            await event.reply("❌ Normal admins can only distribute limit to regular users.")
+            return
+
+        if not await can_manage_target_user(event, target_user_id):
+            if get_manager_id(target_user_id) is not None:
+                await event.reply("❌ You can only set limit for users inside your own branch.")
+                return
+
+        used_by_others = get_direct_child_limit_sum(actor_user_id, like_type, exclude_user_id=target_user_id)
+        parent_limit = get_user_limit(actor_user_id, like_type)
+        parent_used = get_user_used_count(actor_user_id, like_type)
+        if used_by_others + parent_used + limit > parent_limit:
+            remaining = max(parent_limit - used_by_others - parent_used, 0)
+            await event.reply(
+                f"❌ Not enough distributable limit.\n"
+                f"🎯 Like type: `{like_type}`\n"
+                f"📌 Your total limit: `{parent_limit}`\n"
+                f"🔄 Remaining distributable: `{remaining}`"
+            )
+            return
+
+        existing_manager_id = get_manager_id(target_user_id)
+        if existing_manager_id is not None and existing_manager_id != actor_user_id:
+            await event.reply(
+                f"❌ User `{target_user_id}` already belongs to manager `{existing_manager_id}`."
+            )
+            return
+
+    if target_user_id != actor_user_id and get_manager_id(target_user_id) is None and not actor_is_owner:
+        set_manager_for_user(target_user_id, actor_user_id)
+
     user_limits = USER_LIMITS.setdefault(target_user_id, {})
     user_limits[like_type] = limit
     save_state()
@@ -561,6 +829,7 @@ async def like_command_handler(event):
         if likes_added >= THRESHOLD:
             # SUCCESS -> count this request
             increment_usage_for_user(event.sender_id, like_type)
+            await record_like_activity(event, uid, like_type, likes_added)
         else:
             # Not enough likes added -> don't count towards limit, just a short note
             formatted_message += "\n\n✅ **Limit refunded**"
@@ -642,7 +911,7 @@ async def help_command_handler(event):
 🛠 **Admin Commands**
 
 - `setadmin @username`
-  ➤ নতুন admin বানাবে
+  ➤ নিজের branch-এর নিচে নতুন normal admin বানাবে
   উদাহরণ: `setadmin @testuser`
 
 - `removeadmin @username`
@@ -650,18 +919,22 @@ async def help_command_handler(event):
   উদাহরণ: `removeadmin @testuser`
 
 - `setsuperadmin @username`
-  ➤ pending super admin request শুরু করবে
+  ➤ main admin নতুন super admin request শুরু করবে
   উদাহরণ: `setsuperadmin @testuser`
 
 - `superauth <api_id> <api_hash> <session_string>`
   ➤ invited user নিজের credentials submit করে super admin verify করবে
 
+- `setsplimit <n> @username <100|200>`
+  ➤ main admin নির্দিষ্ট super admin-এর shared pool limit set করবে
+  উদাহরণ: `setsplimit 1000 @testsuper 100`
+
 - `setlimit <n> <100|200>`  
-  ➤ নিজের monthly limit `n` set করবে selected like package-এর জন্য  
-  উদাহরণ: `setlimit 10 100`
+  ➤ main admin নিজের account limit set করবে
+  উদাহরণ: `setlimit 1000 100`
 
 - `setlimit <n> @username <100|200>`  
-  ➤ নির্দিষ্ট user-এর জন্য `100` বা `200` like package set করবে  
+  ➤ নির্দিষ্ট child user/admin-এর জন্য limit set করবে
   উদাহরণ: `setlimit 5 @testuser 200`
 
 - `resetlimit` / `/resetlimit`  
@@ -671,7 +944,7 @@ async def help_command_handler(event):
   ➤ ঐ user-এর এই মাসের usage reset করবে
 
 - `alllimit` / `/alllimit`  
-  ➤ এই মাসের জন্য সব user-এর 100/200 used / limit / remaining list দেখাবে
+  ➤ শুধু নিজের branch-এর user data দেখাবে
 """
 
     # Owner/admin হলে full help, regular user হলে শুধু user commands
@@ -684,7 +957,10 @@ async def help_command_handler(event):
 - Commands case-insensitive: `like`, `Like`, `LIKE` সব কাজ করবে
 - Slash (`/`) সহ বা ছাড়া – দু’ভাবেই command দেওয়া যাবে
 - Valid UID numeric হতে হবে
-- `setadmin` এবং `setsuperadmin` owner বা verified super admin use করতে পারবে
+- Main admin super admin-এর limit set করবে
+- `setsplimit` দিয়ে দেওয়া super admin pool সে নিজে use করতে পারবে, আবার একই pool থেকে distribute-ও করতে পারবে
+- Super admin নিজের পাওয়া limit-এর ভিতরে তার user/admin-দের limit distribute করবে
+- এক branch-এর admin অন্য branch-এর data দেখতে পারবে না
 """
     else:
         help_message = f"""📖 **Help**
@@ -712,7 +988,7 @@ async def setadmin_command_handler(event):
       /setadmin @username
     """
     await log_access_check(event, "setadmin")
-    if not await is_super_admin(event):
+    if not await can_create_admin(event):
         await event.reply(await build_access_denied_message(event, "Super Admin", "setadmin"))
         return
 
@@ -743,7 +1019,7 @@ async def removeadmin_command_handler(event):
       /removeadmin @username
     """
     await log_access_check(event, "removeadmin")
-    if not await is_super_admin(event):
+    if not await can_create_admin(event):
         await event.reply(await build_access_denied_message(event, "Super Admin", "removeadmin"))
         return
 
@@ -774,8 +1050,8 @@ async def setsuperadmin_command_handler(event):
       /setsuperadmin @username
     """
     await log_access_check(event, "setsuperadmin")
-    if not await is_super_admin(event):
-        await event.reply(await build_access_denied_message(event, "Super Admin", "setsuperadmin"))
+    if not await can_create_super_admin(event):
+        await event.reply(await build_access_denied_message(event, "Owner", "setsuperadmin"))
         return
 
     text = event.raw_text.strip()
@@ -833,8 +1109,8 @@ async def setlimit_command_handler(event):
     """
     Set monthly limit for a user.
     Usage:
-      /setlimit 5 100           -> set your own 100-like monthly limit
-      /setlimit 5 @username 200 -> set 200-like monthly limit for @username
+      /setlimit 1000 100        -> owner sets own top-level limit
+      /setlimit 5 @username 200 -> set 200-like monthly limit for a managed child
     """
     # Allow owner and delegated admins
     await log_access_check(event, "setlimit")
@@ -868,6 +1144,47 @@ async def setlimit_command_handler(event):
         target_user_id, _ = await get_sender_identity(event)
 
     await set_limit_for_user(event, target_user_id, limit, like_type)
+
+
+@client.on(events.NewMessage(pattern=r'(?i)^/?setsplimit\s+(\d+)\s+(@?\w+)\s+(100|200)$'))
+async def setsplimit_command_handler(event):
+    """
+    Set a super admin pool limit.
+    Usage:
+      /setsplimit 1000 @username 100
+    """
+    await log_access_check(event, "setsplimit")
+    if not await is_owner(event):
+        await event.reply(await build_access_denied_message(event, "Owner", "setsplimit"))
+        return
+
+    text = event.raw_text.strip()
+    match = re.match(r'(?i)^/?setsplimit\s+(\d+)\s+(@?\w+)\s+(100|200)$', text)
+    if not match:
+        await event.reply("❌ Invalid format.\nUsage: `/setsplimit 1000 @username 100`")
+        return
+
+    limit = int(match.group(1))
+    username = match.group(2)
+    like_type = int(match.group(3))
+    active_client = get_event_client(event)
+
+    try:
+        entity = await active_client.get_entity(username)
+        target_user_id = entity.id
+    except Exception as e:
+        await event.reply(f"❌ Could not find user `{username}`\nError: `{e}`")
+        return
+
+    if target_user_id not in SUPER_ADMIN_USERS:
+        await event.reply("❌ This command only works for verified super admins.")
+        return
+
+    await set_limit_for_user(event, target_user_id, limit, like_type)
+    await event.reply(
+        f"ℹ️ Super admin `{target_user_id}` can now use this `{like_type}` pool personally "
+        "and also distribute from the same pool to their users."
+    )
 
 
 @client.on(events.NewMessage(pattern=r'(?i)^/?resetlimit(?:\s+(@?\w+))?$'))
@@ -914,9 +1231,11 @@ async def mylimit_command_handler(event):
     Usage: /mylimit
     """
     user_id, _ = await get_sender_identity(event)
+    role = await get_access_role(event)
     lines = [
         "📊 **Your Limit Status**\n",
         f"👤 User ID: `{user_id}`",
+        f"🛡 Role: `{role}`",
         f"📅 Month: `{_this_month_str()}`",
         ""
     ]
@@ -932,6 +1251,10 @@ async def mylimit_command_handler(event):
             f"📌 Monthly Limit: `{limit}` request(s)\n"
             f"🔄 Remaining: `{remaining}` request(s)\n"
         )
+
+        if role in {"Super Admin", "Admin"}:
+            distributable = get_remaining_distributable_limit(user_id, like_type)
+            lines.append(f"📤 Can Distribute: `{distributable}` request(s)\n")
 
     await event.reply("\n".join(lines))
 
@@ -958,14 +1281,15 @@ async def myaccess_command_handler(event):
         f"🔐 **Your Access**\n\n"
         f"👤 User ID: `{sender_id}`\n"
         f"🏷 Username: `{('@' + sender_username) if sender_username else 'N/A'}`\n"
-        f"🛡 Role: `{role}`"
+        f"🛡 Role: `{role}`\n"
+        f"👤 Manager ID: `{get_manager_id(sender_id) or 'N/A'}`"
     )
 
 
 @client.on(events.NewMessage(pattern=r'(?i)^/?alllimit$'))
 async def alllimit_command_handler(event):
     """
-    Show this month's usage & limits for all users (owner only).
+    Show this month's usage & limits only for the caller's own branch.
     Usage: alllimit / /alllimit
     """
     # Allow owner and delegated admins
@@ -976,17 +1300,22 @@ async def alllimit_command_handler(event):
 
     this_month = _this_month_str()
 
-    # Collect all user_ids from limits and usage
-    user_ids = set(USER_LIMITS.keys())
-    for (uid, month_str), _ in USER_USAGE.items():
-        if month_str == this_month:
-            user_ids.add(uid)
+    actor_user_id, _ = await get_sender_identity(event)
+
+    if await is_owner(event):
+        user_ids = set(USER_LIMITS.keys())
+        for (uid, month_str, like_type), _ in USER_USAGE.items():
+            if month_str == this_month and like_type in LIKE_TYPES:
+                user_ids.add(uid)
+    else:
+        user_ids = get_descendant_user_ids(actor_user_id)
+        user_ids.add(actor_user_id)
 
     if not user_ids:
         await event.reply("📊 এই মাসে এখনও কেউ কোনো request পাঠায়নি।")
         return
 
-    lines = [f"📊 **All Users Limit Status**\n📅 Month: `{this_month}`\n"]
+    lines = [f"📊 **Branch Limit Status**\n📅 Month: `{this_month}`\n"]
 
     # Pre-fetch entities for better names (best-effort)
     name_cache = {}
@@ -1022,6 +1351,12 @@ async def alllimit_command_handler(event):
                 f"🔥 `{like_type}` Like: used `{used}` / `{limit}` | remaining `{remaining}`"
             )
 
+            if uid in ADMIN_USERS or uid in SUPER_ADMIN_USERS or uid == actor_user_id:
+                distributable = get_remaining_distributable_limit(uid, like_type)
+                user_block.append(
+                    f"📤 `{like_type}` Distributable Remaining: `{distributable}`"
+                )
+
         lines.append("\n".join(user_block) + "\n")
 
     msg = "\n".join(lines)
@@ -1036,6 +1371,7 @@ HANDLER_SPECS = [
     (removeadmin_command_handler, r'(?i)^/?removeadmin\s+(@?\w+)$'),
     (setsuperadmin_command_handler, r'(?i)^/?setsuperadmin\s+(@?\w+)$'),
     (superauth_command_handler, r'(?i)^/?superauth\s+(\d+)\s+([A-Za-z0-9]+)\s+(.+)$'),
+    (setsplimit_command_handler, r'(?i)^/?setsplimit\s+(\d+)\s+(@?\w+)\s+(100|200)$'),
     (setlimit_command_handler, r'(?i)^/?setlimit\s+(\d+)(?:\s+(@?\w+))?\s+(100|200)$'),
     (resetlimit_command_handler, r'(?i)^/?resetlimit(?:\s+(@?\w+))?$'),
     (mylimit_command_handler, r'(?i)^/?mylimit$'),
@@ -1085,8 +1421,151 @@ async def start_super_admin_clients():
             print(f"⚠️ Failed to start super admin client for {user_id}: {e}")
 
 
+async def resolve_user_label(user_id: int) -> dict:
+    """Resolve a safe dashboard label for a user id."""
+    creds = SUPER_ADMIN_CREDENTIALS.get(user_id, {})
+    verified_username = creds.get('verified_account_username')
+    if verified_username:
+        return {
+            'id': user_id,
+            'username': f"@{verified_username}",
+            'name': f"@{verified_username}",
+        }
+
+    try:
+        entity = await MAIN_CLIENT.get_entity(user_id)
+        username = getattr(entity, 'username', None)
+        first = getattr(entity, 'first_name', '') or ''
+        last = getattr(entity, 'last_name', '') or ''
+        full_name = (first + ' ' + last).strip()
+        return {
+            'id': user_id,
+            'username': f"@{username}" if username else '',
+            'name': full_name or (f"@{username}" if username else str(user_id)),
+        }
+    except Exception:
+        return {
+            'id': user_id,
+            'username': '',
+            'name': str(user_id),
+        }
+
+
+def get_role_name_for_user(user_id: int, owner_id: int) -> str:
+    """Return dashboard role label for a user id."""
+    if user_id == owner_id:
+        return "Main Admin"
+    if user_id in SUPER_ADMIN_USERS:
+        return "Super Admin"
+    if user_id in ADMIN_USERS:
+        return "Admin"
+    return "User"
+
+
+async def build_dashboard_payload() -> dict:
+    """Build a sanitized dashboard payload for the frontend."""
+    me = await MAIN_CLIENT.get_me()
+    owner_id = me.id
+    month = _this_month_str()
+
+    known_user_ids = set(USER_LIMITS.keys())
+    known_user_ids.update(USER_MANAGERS.keys())
+    known_user_ids.update(USER_MANAGERS.values())
+    known_user_ids.update(ADMIN_USERS)
+    known_user_ids.update(SUPER_ADMIN_USERS)
+    known_user_ids.add(owner_id)
+    for item in REQUEST_ACTIVITY:
+        actor_id = item.get('actor_id')
+        manager_id = item.get('manager_id')
+        if actor_id is not None:
+            known_user_ids.add(int(actor_id))
+        if manager_id is not None:
+            known_user_ids.add(int(manager_id))
+
+    labels = {}
+    for user_id in known_user_ids:
+        labels[user_id] = await resolve_user_label(user_id)
+
+    def build_usage(user_id: int, like_type: int) -> int:
+        return USER_USAGE.get((user_id, month, like_type), 0)
+
+    def build_user_summary(user_id: int) -> dict:
+        label = labels[user_id]
+        return {
+            'id': user_id,
+            'username': label.get('username', ''),
+            'name': label.get('name', str(user_id)),
+            'role': get_role_name_for_user(user_id, owner_id),
+            'limit100': get_user_limit(user_id, 100),
+            'used100': build_usage(user_id, 100),
+            'limit200': get_user_limit(user_id, 200),
+            'used200': build_usage(user_id, 200),
+        }
+
+    super_admins = []
+    for user_id in sorted(uid for uid in SUPER_ADMIN_USERS if uid != owner_id):
+        direct_children = sorted(get_direct_children(user_id))
+        admins = [build_user_summary(child_id) for child_id in direct_children if child_id in ADMIN_USERS and child_id not in SUPER_ADMIN_USERS]
+        for admin in admins:
+            admin['users'] = [
+                build_user_summary(child_id)
+                for child_id in sorted(get_direct_children(admin['id']))
+                if child_id not in ADMIN_USERS and child_id not in SUPER_ADMIN_USERS
+            ]
+
+        direct_users = [
+            build_user_summary(child_id)
+            for child_id in direct_children
+            if child_id not in ADMIN_USERS and child_id not in SUPER_ADMIN_USERS
+        ]
+
+        node = build_user_summary(user_id)
+        node['distributed100'] = get_direct_child_limit_sum(user_id, 100)
+        node['distributed200'] = get_direct_child_limit_sum(user_id, 200)
+        node['admins'] = admins
+        node['directUsers'] = direct_users
+        super_admins.append(node)
+
+    recent_activity = []
+    for item in reversed(REQUEST_ACTIVITY[-50:]):
+        actor_id = item.get('actor_id')
+        manager_id = item.get('manager_id')
+        actor_label = labels.get(actor_id, {'name': str(actor_id), 'username': ''})
+        manager_label = labels.get(manager_id, {'name': 'Main Admin'}) if manager_id is not None else {'name': 'Main Admin'}
+        recent_activity.append({
+            'at': item.get('at', ''),
+            'actor': item.get('actor_name') or actor_label.get('name', str(actor_id)),
+            'actorRole': item.get('actor_role') or get_role_name_for_user(actor_id, owner_id),
+            'manager': manager_label.get('name', 'Main Admin'),
+            'uid': item.get('uid', ''),
+            'packageType': item.get('packageType', 0),
+            'likesAdded': item.get('likesAdded', 0),
+        })
+
+    total_admins = len([uid for uid in ADMIN_USERS if uid not in SUPER_ADMIN_USERS and uid != owner_id])
+    total_users = len([
+        uid for uid in known_user_ids
+        if uid not in ADMIN_USERS and uid not in SUPER_ADMIN_USERS and uid != owner_id
+    ])
+
+    return {
+        'generatedAt': _utc_timestamp_str(),
+        'month': month,
+        'summary': {
+            'totalSuperAdmins': len(super_admins),
+            'totalAdmins': total_admins,
+            'totalUsers': total_users,
+            'totalUidRequests': len(recent_activity),
+            'totalDistributed100': sum(item['distributed100'] for item in super_admins),
+            'totalDistributed200': sum(item['distributed200'] for item in super_admins),
+        },
+        'superAdmins': super_admins,
+        'recentActivity': recent_activity,
+    }
+
+
 async def main():
-    """Main function to start the bot and a minimal web server (for Render Web Service)."""
+    """Main function to start the bot and the built-in dashboard web server."""
     print("🚀 Starting Free Fire Like Bot...")
     init_mongodb()
     load_state()
@@ -1115,13 +1594,40 @@ async def main():
     await start_super_admin_clients()
 
     # ----------------------
-    # Minimal HTTP server (for Render Web Service port binding)
+    # HTTP server for dashboard + health endpoint
     # ----------------------
     async def health(request):
         return web.Response(text="OK")
 
+    async def dashboard_index(request):
+        index_path = DASHBOARD_DIR / "index.html"
+        if not index_path.exists():
+            return web.Response(
+                text="Dashboard file not found. Expected index.html in project root.",
+                status=404,
+            )
+        return web.FileResponse(index_path)
+
+    async def dashboard_asset(request):
+        allowed_files = {"style.css", "app.js"}
+        filename = request.match_info["filename"]
+        if filename not in allowed_files:
+            raise web.HTTPNotFound(text="Asset not found.")
+
+        asset_path = DASHBOARD_DIR / filename
+        if not asset_path.exists():
+            raise web.HTTPNotFound(text=f"Missing asset: {filename}")
+
+        return web.FileResponse(asset_path)
+
+    async def dashboard_api(request):
+        payload = await build_dashboard_payload()
+        return web.json_response(payload)
+
     app = web.Application()
-    app.router.add_get("/", health)
+    app.router.add_get("/", dashboard_index)
+    app.router.add_get(r"/{filename:style\.css|app\.js}", dashboard_asset)
+    app.router.add_get("/api/dashboard", dashboard_api)
     app.router.add_get("/health", health)
 
     port = int(os.getenv("PORT", 8000))  # Render will set PORT
@@ -1131,6 +1637,7 @@ async def main():
     await site.start()
 
     print(f"🌐 HTTP server running on port {port}")
+    print(f"🖥 Dashboard: http://127.0.0.1:{port}/")
     print("✅ Bot is running! Send /start to begin.")
     print("Press Ctrl+C to stop.")
 
