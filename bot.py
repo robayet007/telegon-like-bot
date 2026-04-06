@@ -460,6 +460,9 @@ def format_response(data):
     return message
 
 
+RESPONSE_FOOTER = "\n━━━━━━━━━━━━━━━━━━━━\n🤖 Powered by @Mohammadrobayet"
+
+
 def get_likes_added(data) -> int:
     """
     Calculate how many likes were actually added for limit logic.
@@ -561,6 +564,8 @@ async def like_command_handler(event):
         else:
             # Not enough likes added -> don't count towards limit, just a short note
             formatted_message += "\n\n✅ **Limit refunded**"
+
+        formatted_message += RESPONSE_FOOTER
 
         try:
             await processing_msg.edit(formatted_message)
