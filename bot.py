@@ -1,10 +1,14 @@
 import os
 import asyncio
+import base64
+import hashlib
+import hmac
 import re
 import json
 from decimal import Decimal, InvalidOperation, getcontext
 from datetime import datetime
 from pathlib import Path
+from cryptography.fernet import Fernet, InvalidToken
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from telethon import TelegramClient, events
@@ -25,6 +29,9 @@ SESSION_STRING = os.getenv('SESSION_STRING')
 MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://127.0.0.1:27017')
 MONGODB_DB = os.getenv('MONGODB_DB', 'ff_like_bot')
 MONGODB_STATE_COLLECTION = os.getenv('MONGODB_STATE_COLLECTION', 'bot_state')
+STOCK_TOKEN_SECRET = os.getenv('STOCK_TOKEN_SECRET') or f"{API_HASH}:{API_KEY}"
+UCBOT_TOPUP_URL = os.getenv('UCBOT_TOPUP_URL', 'http://api.ucbot.store/topup-sync')
+UCBOT_AUTH_TOKEN = os.getenv('UCBOT_AUTH_TOKEN', '')
 
 # Create Telegram client
 if SESSION_STRING:
@@ -63,6 +70,18 @@ USER_PROFILES = {}
 # Hierarchy ownership: child_user_id -> manager_user_id
 USER_MANAGERS = {}
 
+# Per-manager signup prefix: user_id -> single-character prefix
+MANAGER_PREFIXES = {}
+
+# Internal payment info: user_id -> {due, balance, due_limit}
+USER_FINANCE = {}
+
+# Branch UC stock: owner_user_id -> {category: [signed_token, ...]}
+UC_STOCK = {}
+
+# Branch UC rate list: owner_user_id -> {category: price}
+UC_RATES = {}
+
 # Extra admins promoted by the owner: user_id set
 ADMIN_USERS = set()
 
@@ -74,6 +93,8 @@ PENDING_SUPER_ADMINS = {}
 
 # Verified super admin credentials kept in memory
 SUPER_ADMIN_CREDENTIALS = {}
+STATE_LOCK = asyncio.Lock()
+TOPUP_ORDER_SEQ = 0
 
 mongo_client = None
 mongo_db = None
@@ -83,6 +104,68 @@ getcontext().prec = 28
 
 CALCULATOR_ALLOWED_PATTERN = re.compile(r'^[\d\s+\-*/().%]+$')
 CALCULATOR_TOKEN_PATTERN = re.compile(r'\d+(?:\.\d+)?|[()+\-*/%]')
+UC_CATEGORY_PATTERNS = {
+    '20': [r'(BDMB-T-S-\d{8})[,\s]+([\d\-]+)', r'(UPBD-Q-S-\d{8})[,\s]+([\d\-]+)'],
+    '36': [r'(BDMB-U-S-\d{8})[,\s]+([\d\-]+)', r'(UPBD-R-S-\d{8})[,\s]+([\d\-]+)'],
+    '80': [r'(BDMB-J-S-\d{8})[,\s]+([\d\-]+)', r'(UPBD-G-S-\d{8})[,\s]+([\d\-]+)'],
+    '160': [r'(BDMB-I-S-\d{8})[,\s]+([\d\-]+)', r'(UPBD-F-S-\d{8})[,\s]+([\d\-]+)'],
+    '161': [r'(BDMB-Q-S-\d{8})[,\s]+([\d\-]+)', r'(UPBD-N-S-\d{8})[,\s]+([\d\-]+)'],
+    '162': [r'(BDMB-R-S-\d{8})[,\s]+([\d\-]+)', r'(UPBD-O-S-\d{8})[,\s]+([\d\-]+)'],
+    '405': [r'(BDMB-K-S-\d{8})[,\s]+([\d\-]+)', r'(UPBD-H-S-\d{8})[,\s]+([\d\-]+)'],
+    '800': [r'(BDMB-S-S-\d{8})[,\s]+([\d\-]+)', r'(UPBD-P-S-\d{8})[,\s]+([\d\-]+)'],
+    '810': [r'(BDMB-L-S-\d{8})[,\s]+([\d\-]+)', r'(UPBD-I-S-\d{8})[,\s]+([\d\-]+)'],
+    '1625': [r'(BDMB-M-S-\d{8})[,\s]+([\d\-]+)', r'(UPBD-J-S-\d{8})[,\s]+([\d\-]+)'],
+    '2000': [r'(UPBD-7-S-\d{8})[,\s]+([\d\-]+)'],
+}
+UC_STOCK_CATEGORY_ORDER = ['20', '36', '80', '160', '161', '162', '405', '800', '810', '1625', '2000']
+UC_STOCK_WORTH_USDT = {
+    '20': Decimal('0'),
+    '36': Decimal('0'),
+    '80': Decimal('0'),
+    '160': Decimal('0'),
+    '161': Decimal('0'),
+    '162': Decimal('0'),
+    '405': Decimal('0'),
+    '800': Decimal('0'),
+    '810': Decimal('0'),
+    '1625': Decimal('0'),
+    '2000': Decimal('0'),
+}
+TOPUP_PRODUCT_MAP = {
+    '25': {'category': '20', 'label': '25 Diamond', 'fee': Decimal('0.5')},
+    '50': {'category': '36', 'label': '50 Diamond', 'fee': Decimal('0.5')},
+    '115': {'category': '80', 'label': '115 Diamond', 'fee': Decimal('0.5')},
+    '240': {'category': '160', 'label': '240 Diamond', 'fee': Decimal('0.5')},
+    'weekly': {'category': '161', 'label': 'Weekly', 'fee': Decimal('0.5')},
+    '610': {'category': '405', 'label': '610 Diamond', 'fee': Decimal('0.5')},
+    'monthly': {'category': '800', 'label': 'Monthly', 'fee': Decimal('0.5')},
+    '1240': {'category': '810', 'label': '1240 Diamond', 'fee': Decimal('0.5')},
+    '2530': {'category': '1625', 'label': '2530 Diamond', 'fee': Decimal('0.5')},
+}
+TOPUP_DIAMOND_ALIASES = {
+    '25': '25',
+    '50': '50',
+    '115': '115',
+    '240': '240',
+    '161': 'weekly',
+    'weekly': 'weekly',
+    '610': '610',
+    '800': 'monthly',
+    'monthly': 'monthly',
+    '810': '1240',
+    '1240': '1240',
+    '1625': '2530',
+    '2530': '2530',
+}
+
+
+def _build_fernet(secret: str) -> Fernet:
+    """Derive a Fernet key from an application secret."""
+    key_material = hashlib.sha256(secret.encode('utf-8')).digest()
+    return Fernet(base64.urlsafe_b64encode(key_material))
+
+
+FERNET = _build_fernet(STOCK_TOKEN_SECRET)
 
 
 class CalculatorError(Exception):
@@ -241,6 +324,7 @@ def load_state():
     """Load persistent bot state from MongoDB."""
     global USER_LIMITS, USER_USAGE, USER_MANAGERS, ADMIN_USERS, SUPER_ADMIN_USERS
     global PENDING_SUPER_ADMINS, SUPER_ADMIN_CREDENTIALS, REQUEST_ACTIVITY, USER_PROFILES
+    global MANAGER_PREFIXES, USER_FINANCE, UC_STOCK, UC_RATES, TOPUP_ORDER_SEQ
 
     if state_collection is None:
         return
@@ -267,6 +351,58 @@ def load_state():
             int(user_id): int(manager_id)
             for user_id, manager_id in data.get('user_managers', {}).items()
         }
+        MANAGER_PREFIXES = {
+            int(user_id): str(prefix)
+            for user_id, prefix in data.get('manager_prefixes', {}).items()
+            if str(prefix).strip()
+        }
+        USER_FINANCE = {}
+        for user_id, finance_blob in data.get('user_finance', {}).items():
+            if isinstance(finance_blob, str):
+                finance = decrypt_payload_token(finance_blob, 'user-finance')
+                if finance is None:
+                    continue
+            else:
+                finance = finance_blob
+
+            USER_FINANCE[int(user_id)] = {
+                'due': str(finance.get('due', '0')),
+                'balance': str(finance.get('balance', '0')),
+                'due_limit': str(finance.get('due_limit', '0')),
+                'purchases': {
+                    str(product): int(count)
+                    for product, count in finance.get('purchases', {}).items()
+                },
+            }
+
+        UC_STOCK = {}
+        for owner_id, stock_blob in data.get('uc_stock', {}).items():
+            if isinstance(stock_blob, str):
+                category_map = decrypt_payload_token(stock_blob, 'branch-stock')
+                if category_map is None:
+                    continue
+            else:
+                category_map = stock_blob
+
+            UC_STOCK[int(owner_id)] = {
+                str(category): list(tokens)
+                for category, tokens in category_map.items()
+            }
+
+        UC_RATES = {}
+        for owner_id, rate_blob in data.get('uc_rates', {}).items():
+            if isinstance(rate_blob, str):
+                category_map = decrypt_payload_token(rate_blob, 'branch-rates')
+                if category_map is None:
+                    continue
+            else:
+                category_map = rate_blob
+
+            UC_RATES[int(owner_id)] = {
+                str(category): str(price)
+                for category, price in category_map.items()
+            }
+        TOPUP_ORDER_SEQ = int(data.get('topup_order_seq', 0))
         ADMIN_USERS = set(int(user_id) for user_id in data.get('admin_users', []))
         SUPER_ADMIN_USERS = set(int(user_id) for user_id in data.get('super_admin_users', []))
         PENDING_SUPER_ADMINS = {
@@ -303,6 +439,23 @@ def save_state():
                 str(user_id): manager_id
                 for user_id, manager_id in USER_MANAGERS.items()
             },
+            'manager_prefixes': {
+                str(user_id): prefix
+                for user_id, prefix in MANAGER_PREFIXES.items()
+            },
+            'user_finance': {
+                str(user_id): encrypt_payload_token(finance, 'user-finance')
+                for user_id, finance in USER_FINANCE.items()
+            },
+            'uc_stock': {
+                str(owner_id): encrypt_payload_token(category_map, 'branch-stock')
+                for owner_id, category_map in UC_STOCK.items()
+            },
+            'uc_rates': {
+                str(owner_id): encrypt_payload_token(category_map, 'branch-rates')
+                for owner_id, category_map in UC_RATES.items()
+            },
+            'topup_order_seq': TOPUP_ORDER_SEQ,
             'user_usage': [
                 {
                     'user_id': user_id,
@@ -332,6 +485,12 @@ def save_state():
         state_collection.replace_one({'_id': 'global_state'}, data, upsert=True)
     except Exception as e:
         print(f"⚠️ Failed to save state: {e}")
+
+
+async def save_state_locked():
+    """Persist state while holding the shared async lock."""
+    async with STATE_LOCK:
+        save_state()
 
 
 def _this_month_str():
@@ -366,6 +525,375 @@ def set_manager_for_user(target_user_id: int, manager_user_id: int | None):
         USER_MANAGERS.pop(target_user_id, None)
     else:
         USER_MANAGERS[target_user_id] = manager_user_id
+
+
+def get_manager_prefix(user_id: int) -> str | None:
+    """Return stored signup prefix for an owner/super admin."""
+    prefix = MANAGER_PREFIXES.get(user_id)
+    if not prefix:
+        return None
+    return str(prefix)
+
+
+def set_manager_prefix(user_id: int, prefix: str):
+    """Persist a single-character signup prefix for an owner/super admin."""
+    MANAGER_PREFIXES[user_id] = prefix
+
+
+def _sanitize_money_value(value) -> str:
+    """Convert numeric-like values to a clean decimal string."""
+    try:
+        return str(Decimal(str(value)))
+    except (InvalidOperation, TypeError, ValueError):
+        return '0'
+
+
+def ensure_user_finance_record(user_id: int):
+    """Ensure every known user has a finance record."""
+    if user_id not in USER_FINANCE:
+        USER_FINANCE[user_id] = {
+            'due': '0',
+            'balance': '0',
+            'due_limit': '0',
+            'purchases': {},
+        }
+
+
+def get_user_finance(user_id: int) -> dict:
+    """Return normalized finance info for a user."""
+    ensure_user_finance_record(user_id)
+    finance = USER_FINANCE[user_id]
+    return {
+        'due': _sanitize_money_value(finance.get('due', '0')),
+        'balance': _sanitize_money_value(finance.get('balance', '0')),
+        'due_limit': _sanitize_money_value(finance.get('due_limit', '0')),
+        'purchases': {
+            str(product): int(count)
+            for product, count in finance.get('purchases', {}).items()
+        },
+    }
+
+
+def set_user_due_limit(user_id: int, amount: Decimal):
+    """Set finance due limit for a user."""
+    ensure_user_finance_record(user_id)
+    USER_FINANCE[user_id]['due_limit'] = str(amount)
+
+
+def set_user_balance(user_id: int, amount: Decimal):
+    """Set finance balance for a user."""
+    ensure_user_finance_record(user_id)
+    USER_FINANCE[user_id]['balance'] = str(amount)
+
+
+def format_money_amount(value) -> str:
+    """Render internal finance values without noisy trailing zeros."""
+    normalized = Decimal(str(value)).normalize()
+    if normalized == normalized.to_integral():
+        return str(normalized.quantize(Decimal('1')))
+    return format(normalized, 'f').rstrip('0').rstrip('.')
+
+
+def increment_user_purchase(user_id: int, product_name: str, quantity: int):
+    """Track how many units of a product a user has bought on due."""
+    ensure_user_finance_record(user_id)
+    purchases = USER_FINANCE[user_id].setdefault('purchases', {})
+    purchases[product_name] = int(purchases.get(product_name, 0)) + int(quantity)
+
+
+def get_prefix_owners_for_user(user_id: int) -> list[int]:
+    """Return self + ancestor chain so branch prefixes can be resolved."""
+    owners = []
+    current_user_id = user_id
+    visited = set()
+
+    while current_user_id is not None and current_user_id not in visited:
+        owners.append(current_user_id)
+        visited.add(current_user_id)
+        current_user_id = get_manager_id(current_user_id)
+
+    return owners
+
+
+def resolve_prefix_owner_for_user(user_id: int, prefix_text: str) -> int | None:
+    """Find which self/ancestor owns the provided prefix."""
+    for owner_id in get_prefix_owners_for_user(user_id):
+        owner_prefix = get_manager_prefix(owner_id)
+        if owner_prefix and owner_prefix.lower() == prefix_text.lower():
+            return owner_id
+    return None
+
+
+def is_registered_under_branch(prefix_owner_id: int, target_user_id: int) -> bool:
+    """Return True when a target belongs to the prefix owner's branch."""
+    if target_user_id == prefix_owner_id:
+        return True
+    return is_managed_by(prefix_owner_id, target_user_id)
+
+
+def encrypt_payload_token(payload: dict, purpose: str) -> str:
+    """Encrypt a JSON payload for database storage."""
+    envelope = {
+        'v': 1,
+        'p': purpose,
+        'd': payload,
+    }
+    return FERNET.encrypt(json.dumps(envelope, separators=(',', ':')).encode('utf-8')).decode('utf-8')
+
+
+def decrypt_payload_token(token: str, purpose: str) -> dict | None:
+    """Decrypt a JSON payload token and verify its purpose."""
+    try:
+        envelope_raw = FERNET.decrypt(token.encode('utf-8'))
+        envelope = json.loads(envelope_raw.decode('utf-8'))
+        if not isinstance(envelope, dict):
+            return None
+        if envelope.get('p') != purpose:
+            return None
+        payload = envelope.get('d')
+        if not isinstance(payload, dict):
+            return None
+        return payload
+    except (InvalidToken, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _jwt_b64encode(payload_bytes: bytes) -> str:
+    """Encode bytes using JWT-style base64url without padding."""
+    return base64.urlsafe_b64encode(payload_bytes).rstrip(b'=').decode('ascii')
+
+
+def _jwt_b64decode(payload_text: str) -> bytes:
+    """Decode JWT-style base64url text."""
+    padding = '=' * (-len(payload_text) % 4)
+    return base64.urlsafe_b64decode(payload_text + padding)
+
+
+def decode_legacy_stock_token(token: str) -> dict | None:
+    """Verify and decode the previous signed stock token format."""
+    try:
+        header_b64, payload_b64, signature_b64 = token.split('.')
+        signing_input = f"{header_b64}.{payload_b64}".encode('ascii')
+        expected_signature = hmac.new(STOCK_TOKEN_SECRET.encode('utf-8'), signing_input, hashlib.sha256).digest()
+        provided_signature = _jwt_b64decode(signature_b64)
+        if not hmac.compare_digest(expected_signature, provided_signature):
+            return None
+        payload = json.loads(_jwt_b64decode(payload_b64).decode('utf-8'))
+        if not isinstance(payload, dict):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def make_stock_token(owner_id: int, category: str, code_head: str, code_tail: str) -> str:
+    """Create an encrypted token for one stock code."""
+    payload = {
+        'owner_id': owner_id,
+        'category': category,
+        'code_head': code_head,
+        'code_tail': code_tail,
+        'added_at': _utc_timestamp_str(),
+    }
+    return encrypt_payload_token(payload, 'stock-code')
+
+
+def decode_stock_token(token: str) -> dict | None:
+    """Decrypt a stock token, with legacy fallback for older signed tokens."""
+    payload = decrypt_payload_token(token, 'stock-code')
+    if payload is not None:
+        return payload
+    return decode_legacy_stock_token(token)
+
+
+def ensure_branch_stock(owner_user_id: int):
+    """Ensure a branch stock container exists."""
+    if owner_user_id not in UC_STOCK:
+        UC_STOCK[owner_user_id] = {}
+
+
+def ensure_branch_rates(owner_user_id: int):
+    """Ensure a branch rate container exists."""
+    if owner_user_id not in UC_RATES:
+        UC_RATES[owner_user_id] = {}
+
+
+def set_branch_rate(owner_user_id: int, category: str, price: Decimal):
+    """Set one UC category rate for a branch."""
+    ensure_branch_rates(owner_user_id)
+    UC_RATES[owner_user_id][category] = str(price)
+
+
+def get_branch_rate(owner_user_id: int, category: str) -> Decimal:
+    """Get one UC category rate for a branch."""
+    ensure_branch_rates(owner_user_id)
+    raw_price = UC_RATES[owner_user_id].get(category, '0')
+    try:
+        return Decimal(str(raw_price))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal('0')
+
+
+def extract_uc_stock_entries(raw_text: str) -> tuple[list[dict], int]:
+    """Parse incoming stock text line-by-line into categorized UC code entries."""
+    entries = []
+    ignored_lines = 0
+
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        matched = False
+        for category in UC_STOCK_CATEGORY_ORDER:
+            for pattern in UC_CATEGORY_PATTERNS.get(category, []):
+                match = re.fullmatch(pattern, line, flags=re.IGNORECASE)
+                if not match:
+                    continue
+
+                entries.append({
+                    'category': category,
+                    'code_head': match.group(1).upper().strip(),
+                    'code_tail': match.group(2).strip(),
+                })
+                matched = True
+                break
+            if matched:
+                break
+
+        if not matched:
+            ignored_lines += 1
+
+    return entries, ignored_lines
+
+
+def get_branch_stock_snapshot(owner_user_id: int) -> tuple[dict, set[str]]:
+    """Return category counts and fingerprint set for one branch stock."""
+    ensure_branch_stock(owner_user_id)
+    counts = {category: 0 for category in UC_STOCK_CATEGORY_ORDER}
+    fingerprints = set()
+
+    for category, tokens in UC_STOCK.get(owner_user_id, {}).items():
+        for token in tokens:
+            payload = decode_stock_token(token)
+            if not payload:
+                continue
+            code_head = str(payload.get('code_head', '')).strip().upper()
+            code_tail = str(payload.get('code_tail', '')).strip()
+            token_category = str(payload.get('category', category))
+            fingerprint = f"{code_head}|{code_tail}"
+            fingerprints.add(fingerprint)
+            if token_category in counts:
+                counts[token_category] += 1
+
+    return counts, fingerprints
+
+
+def add_uc_stock_entries(owner_user_id: int, entries: list[dict]) -> tuple[int, int, list[dict]]:
+    """Add new UC entries to branch stock and skip duplicates."""
+    ensure_branch_stock(owner_user_id)
+    _, existing_fingerprints = get_branch_stock_snapshot(owner_user_id)
+    added_count = 0
+    skipped_count = 0
+    duplicate_entries = []
+
+    for entry in entries:
+        category = entry['category']
+        code_head = entry['code_head']
+        code_tail = entry['code_tail']
+        fingerprint = f"{code_head}|{code_tail}"
+        if fingerprint in existing_fingerprints:
+            skipped_count += 1
+            duplicate_entries.append(entry)
+            continue
+
+        UC_STOCK[owner_user_id].setdefault(category, []).append(
+            make_stock_token(owner_user_id, category, code_head, code_tail)
+        )
+        existing_fingerprints.add(fingerprint)
+        added_count += 1
+
+    return added_count, skipped_count, duplicate_entries
+
+
+def pop_branch_stock_entries(owner_user_id: int, category: str, quantity: int) -> list[dict]:
+    """Atomically reserve verified stock entries from a branch category."""
+    decoded_entries, _ = reserve_branch_stock_entries(owner_user_id, category, quantity)
+    return decoded_entries
+
+
+def reserve_branch_stock_entries(owner_user_id: int, category: str, quantity: int) -> tuple[list[dict], list[str]]:
+    """Reserve verified stock entries from a branch category and return entries plus removed tokens."""
+    ensure_branch_stock(owner_user_id)
+    tokens = list(UC_STOCK.get(owner_user_id, {}).get(category, []))
+    if quantity <= 0:
+        return [], []
+
+    decoded_entries = []
+    selected_tokens = []
+    remaining_tokens = []
+
+    for token in tokens:
+        payload = decode_stock_token(token)
+        if not payload:
+            continue
+
+        if len(decoded_entries) < quantity:
+            decoded_entries.append({
+                'category': str(payload.get('category', category)),
+                'code_head': str(payload.get('code_head', '')).strip().upper(),
+                'code_tail': str(payload.get('code_tail', '')).strip(),
+            })
+            selected_tokens.append(token)
+            continue
+
+        remaining_tokens.append(token)
+
+    if len(decoded_entries) < quantity:
+        UC_STOCK[owner_user_id][category] = selected_tokens + remaining_tokens
+        return [], []
+
+    UC_STOCK[owner_user_id][category] = remaining_tokens
+    return decoded_entries, selected_tokens
+
+
+def restore_branch_stock_tokens(owner_user_id: int, category: str, tokens: list[str]):
+    """Put reserved stock tokens back into the front of the branch category list."""
+    if not tokens:
+        return
+    ensure_branch_stock(owner_user_id)
+    existing = list(UC_STOCK.get(owner_user_id, {}).get(category, []))
+    UC_STOCK[owner_user_id][category] = list(tokens) + existing
+
+
+def build_stock_summary_message(owner_user_id: int) -> str:
+    """Render branch stock summary in the requested format."""
+    counts, _ = get_branch_stock_snapshot(owner_user_id)
+    total_worth = Decimal('0')
+    lines = ["▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔"]
+
+    for category in UC_STOCK_CATEGORY_ORDER:
+        count = counts.get(category, 0)
+        total_worth += get_branch_rate(owner_user_id, category) * Decimal(count)
+        lines.append(f"☞︎︎︎ {category:<4} 🆄︎🅲︎  ➪  {count} ᴘᴄs")
+        lines.append("")
+
+    lines.append("▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔")
+    lines.append(f"Wᴏʀᴛʜ Oғ : {format_money_amount(total_worth)} ᴜsᴅᴛ")
+    return "\n".join(lines)
+
+
+def build_rate_list_message(owner_user_id: int) -> str:
+    """Render branch rate list in the requested format."""
+    lines = ["▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔"]
+
+    for category in UC_STOCK_CATEGORY_ORDER:
+        price = format_money_amount(get_branch_rate(owner_user_id, category))
+        lines.append(f"☞︎︎︎ {category:<4} 🆄︎🅲︎  ➪  {price} Bᴀɴᴋ")
+        lines.append("")
+
+    lines.append("▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔")
+    return "\n".join(lines)
 
 
 def get_direct_children(manager_user_id: int) -> set[int]:
@@ -596,6 +1124,21 @@ async def can_create_admin(event) -> bool:
     return await is_super_admin(event)
 
 
+async def can_use_signup_prefix(event) -> bool:
+    """Only owner and super admins can register users with a prefix command."""
+    return await is_super_admin(event)
+
+
+async def can_set_prefix(event) -> bool:
+    """Any admin-level account can save a branch prefix."""
+    return await is_admin(event)
+
+
+async def can_manage_due_limit(event) -> bool:
+    """Owner, super admins, and admins can manage due limits in their branch."""
+    return await is_admin(event)
+
+
 async def can_manage_target_user(event, target_user_id: int, allow_self: bool = False) -> bool:
     """Check whether the sender can manage the target based on hierarchy."""
     actor_user_id, _ = await get_sender_identity(event)
@@ -694,6 +1237,545 @@ async def remove_admin_for_user(event, target_user_id: int):
     set_manager_for_user(target_user_id, None)
     save_state()
     await event.reply(f"✅ Admin access removed for user `{target_user_id}`")
+
+
+async def register_user_under_manager(event, target_user_id: int):
+    """Attach a regular user to the sender's branch."""
+    actor_user_id, _ = await get_sender_identity(event)
+
+    if target_user_id == actor_user_id:
+        await event.reply("❌ You cannot register yourself with signup.")
+        return
+
+    existing_manager_id = get_manager_id(target_user_id)
+    if existing_manager_id == actor_user_id:
+        username_text = "N/A"
+        profile = USER_PROFILES.get(target_user_id, {})
+        if profile.get('username'):
+            username_text = f"@{profile['username']}"
+
+        await event.reply(
+            "ℹ️ 𝗨𝘀𝗲𝗿 𝗔𝗹𝗿𝗲𝗮𝗱𝘆 𝗥𝗲𝗴𝗶𝘀𝘁𝗲𝗿𝗲𝗱\n\n"
+            f"🆔 𝗨𝘀𝗲𝗿 𝗜𝗗: `{target_user_id}`\n"
+            f"👤 𝗨𝘀𝗲𝗿𝗻𝗮𝗺𝗲: `{username_text}`\n"
+            "⚠️ 𝗔𝗹𝗿𝗲𝗮𝗱𝘆 𝗿𝗲𝗴𝗶𝘀𝘁𝗲𝗿𝗲𝗱 𝘂𝗻𝗱𝗲𝗿 𝘆𝗼𝘂𝗿 𝗯𝗿𝗮𝗻𝗰𝗵."
+        )
+        return
+
+    role_text = "User"
+    if target_user_id in SUPER_ADMIN_USERS:
+        role_text = "Super Admin"
+    elif target_user_id in ADMIN_USERS:
+        role_text = "Admin"
+
+    async with STATE_LOCK:
+        set_manager_for_user(target_user_id, actor_user_id)
+        ensure_user_finance_record(target_user_id)
+        save_state()
+    await event.reply(
+        "✅ 𝗦𝗶𝗴𝗻𝘂𝗽 𝗦𝘂𝗰𝗰𝗲𝘀𝘀𝗳𝘂𝗹\n\n"
+        f"🆔 𝗨𝘀𝗲𝗿 𝗜𝗗: `{target_user_id}`\n"
+        f"🛡 𝗥𝗼𝗹𝗲: `{role_text}`\n"
+        f"👤 𝗠𝗮𝗻𝗮𝗴𝗲𝗿 𝗜𝗗: `{actor_user_id}`"
+    )
+
+
+async def signout_user_from_manager(event, target_user_id: int):
+    """Remove any managed account from the sender's branch."""
+    actor_user_id, _ = await get_sender_identity(event)
+
+    if target_user_id == actor_user_id:
+        await event.reply("❌ You cannot sign out yourself.")
+        return
+
+    existing_manager_id = get_manager_id(target_user_id)
+    if existing_manager_id is None:
+        await event.reply(
+            "ℹ️ 𝗨𝘀𝗲𝗿 𝗡𝗼𝘁 𝗥𝗲𝗴𝗶𝘀𝘁𝗲𝗿𝗲𝗱\n\n"
+            f"🆔 𝗨𝘀𝗲𝗿 𝗜𝗗: `{target_user_id}`\n"
+            "⚠️ 𝗧𝗵𝗶𝘀 𝘂𝘀𝗲𝗿 𝗶𝘀 𝗻𝗼𝘁 𝗿𝗲𝗴𝗶𝘀𝘁𝗲𝗿𝗲𝗱 𝘂𝗻𝗱𝗲𝗿 𝗮𝗻𝘆 𝗯𝗿𝗮𝗻𝗰𝗵."
+        )
+        return
+
+    if existing_manager_id != actor_user_id:
+        await event.reply(
+            f"❌ User `{target_user_id}` belongs to another manager `{existing_manager_id}`."
+        )
+        return
+
+    role_text = "User"
+    if target_user_id in SUPER_ADMIN_USERS:
+        role_text = "Super Admin"
+    elif target_user_id in ADMIN_USERS:
+        role_text = "Admin"
+
+    async with STATE_LOCK:
+        set_manager_for_user(target_user_id, None)
+        save_state()
+    await event.reply(
+        "✅ 𝗨𝘀𝗲𝗿 𝗦𝗶𝗴𝗻𝗲𝗱 𝗢𝘂𝘁\n\n"
+        f"🆔 𝗨𝘀𝗲𝗿 𝗜𝗗: `{target_user_id}`\n"
+        f"🛡 𝗥𝗼𝗹𝗲: `{role_text}`\n"
+        "⚠️ 𝗥𝗲𝗺𝗼𝘃𝗲𝗱 𝗳𝗿𝗼𝗺 𝘆𝗼𝘂𝗿 𝗯𝗿𝗮𝗻𝗰𝗵."
+    )
+
+
+async def set_due_limit_for_managed_user(event, target_user_id: int, amount: Decimal):
+    """Set a due-limit amount for a managed target."""
+    actor_user_id, _ = await get_sender_identity(event)
+    if target_user_id == actor_user_id:
+        await event.reply("❌ You cannot set your own due limit with this command.")
+        return
+
+    can_manage = False
+    if await is_owner(event):
+        can_manage = True
+    elif is_managed_by(actor_user_id, target_user_id):
+        can_manage = True
+
+    if not can_manage:
+        await event.reply("❌ You can only set due limit for users inside your own branch.")
+        return
+
+    async with STATE_LOCK:
+        set_user_due_limit(target_user_id, amount)
+        save_state()
+    await event.reply(
+        "✅ 𝗗𝘂𝗲 𝗟𝗶𝗺𝗶𝘁 𝗨𝗽𝗱𝗮𝘁𝗲𝗱\n\n"
+        f"🆔 𝗨𝘀𝗲𝗿 𝗜𝗗: `{target_user_id}`\n"
+        f"💳 𝗗𝘂𝗲 𝗟𝗶𝗺𝗶𝘁: `{format_money_amount(amount)}` 𝗧𝗸"
+    )
+
+
+async def send_balance_card(event, target_user_id: int):
+    """Show the internal payment snapshot for a branch member."""
+    async with STATE_LOCK:
+        finance = get_user_finance(target_user_id)
+        profile = USER_PROFILES.get(target_user_id, {}).copy()
+    name_text = profile.get('name') or (f"@{profile['username']}" if profile.get('username') else str(target_user_id))
+
+    lines = [
+        "───────〔 USER INFO 〕───────",
+        f"Name      : {name_text}",
+        "",
+        f"Due       : {format_money_amount(finance['due'])} Tk",
+        f"Balance   : {format_money_amount(finance['balance'])} Tk",
+        f"Due Limit : {format_money_amount(finance['due_limit'])} Tk",
+        "───────────────────────────",
+    ]
+    await event.reply("\n".join(lines))
+
+
+async def send_stock_card(event, owner_user_id: int):
+    """Show branch UC stock summary."""
+    async with STATE_LOCK:
+        message = build_stock_summary_message(owner_user_id)
+    await event.reply(message)
+
+
+async def add_branch_stock_from_text(event, owner_user_id: int, raw_stock_text: str):
+    """Parse and store UC stock codes for one branch owner."""
+    entries, ignored_lines = extract_uc_stock_entries(raw_stock_text)
+    if not entries:
+        await event.reply(
+            "❌ No valid UC stock codes found in your message.\n"
+            f"➪ Ignored : {ignored_lines} ʟɪɴᴇs"
+        )
+        return
+
+    async with STATE_LOCK:
+        added_count, skipped_count, duplicate_entries = add_uc_stock_entries(owner_user_id, entries)
+        save_state()
+        stock_message = build_stock_summary_message(owner_user_id)
+
+    duplicate_preview = ""
+    if duplicate_entries:
+        preview_lines = []
+        for entry in duplicate_entries[:5]:
+            preview_lines.append(f"{entry['code_head']} {entry['code_tail']} [{entry['category']} UC]")
+        duplicate_preview = "\n➪ Already :\n" + "\n".join(preview_lines)
+
+    await event.reply(
+        f"✅ 𝗦𝘁𝗼𝗰𝗸 𝗨𝗽𝗱𝗮𝘁𝗲𝗱\n\n"
+        f"➪ Found   : {len(entries)} ᴄᴏᴅᴇs\n"
+        f"➪ Added   : {added_count} ᴄᴏᴅᴇs\n"
+        f"➪ Skipped : {skipped_count} ᴅᴜᴘʟɪᴄᴀᴛᴇs\n\n"
+        f"➪ Ignored : {ignored_lines} ʟɪɴᴇs"
+        f"{duplicate_preview}\n\n"
+        f"{stock_message}"
+    )
+
+
+async def send_rate_card(event, owner_user_id: int):
+    """Show branch UC rates."""
+    async with STATE_LOCK:
+        message = build_rate_list_message(owner_user_id)
+    await event.reply(message)
+
+
+async def send_prefix_help_card(event, prefix: str, prefix_owner_id: int, sender_id: int):
+    """Show branch-prefixed help for users and managers."""
+    user_lines = [
+        "📘 Pʀᴇғɪx Hᴇʟᴘ",
+        "",
+        f"🔑 Pʀᴇғɪx : {prefix}",
+        "",
+        "👤 Usᴇʀ Cᴏᴍᴍᴀɴᴅs",
+        f"- `{prefix}help`",
+        f"- `{prefix}balance`",
+        f"- `{prefix}due`",
+        f"- `{prefix}rate`",
+        f"- `{prefix}stock`",
+        f"- `{prefix}tp <uid> <diamond> [qty]`",
+    ]
+
+    is_prefix_owner = prefix_owner_id == sender_id
+    if is_prefix_owner:
+        user_lines.extend([
+            "",
+            "🛠 Mᴀɴᴀɢᴇʀ Cᴏᴍᴍᴀɴᴅs",
+            f"- `{prefix}signup`",
+            f"- `{prefix}signout`",
+            f"- `{prefix}duelimit <amount>`",
+            f"- `{prefix}balance <amount>`",
+            f"- `{prefix}clear`",
+            f"- `{prefix}stockadd <codes>`",
+            f"- `{prefix}20 <price>`",
+            f"- `{prefix}36 <price>`",
+            f"- `{prefix}80 <price>`",
+            f"- `{prefix}160 <price>`",
+            f"- `{prefix}161 <price>`",
+            f"- `{prefix}162 <price>`",
+            f"- `{prefix}405 <price>`",
+            f"- `{prefix}800 <price>`",
+            f"- `{prefix}810 <price>`",
+            f"- `{prefix}1625 <price>`",
+            f"- `{prefix}2000 <price>`",
+        ])
+
+    await event.reply("\n".join(user_lines))
+
+
+async def set_branch_rate_command(event, owner_user_id: int, category: str, price: Decimal):
+    """Persist one branch UC rate."""
+    async with STATE_LOCK:
+        set_branch_rate(owner_user_id, category, price)
+        save_state()
+
+    await event.reply(f"✅ 𝗥𝗮𝘁𝗲 `{category} UC` 𝘀𝗲𝘁 𝘁𝗼 `{format_money_amount(price)}` 𝗕ᴀɴᴋ")
+
+
+async def send_due_summary_card(event, target_user_id: int):
+    """Show the user's purchased products and total due."""
+    async with STATE_LOCK:
+        finance = get_user_finance(target_user_id)
+        purchases = dict(finance.get('purchases', {}))
+        migrated = False
+
+        for diamond_key, product in TOPUP_PRODUCT_MAP.items():
+            product_label = product['label']
+            category = product['category']
+            legacy_count = int(purchases.get(product_label, 0))
+            if legacy_count > 0:
+                purchases[category] = int(purchases.get(category, 0)) + legacy_count
+                purchases.pop(product_label, None)
+                USER_FINANCE[target_user_id]['purchases'] = purchases
+                migrated = True
+
+        if migrated:
+            save_state()
+            finance = get_user_finance(target_user_id)
+
+    purchases = finance.get('purchases', {})
+    lines = []
+    for product_name, count in purchases.items():
+        if count <= 0:
+            continue
+
+        if product_name in UC_STOCK_CATEGORY_ORDER:
+            lines.append(f"☞︎︎︎ {product_name} 🆄︎🅲︎ ➪ {count} ᴘᴄs")
+        else:
+            lines.append(f"☞︎︎︎ {product_name} ➪ {count} ᴘᴄs")
+        lines.append("")
+
+    if not lines:
+        lines.append("☞︎︎︎ Nᴏ Pᴜʀᴄʜᴀsᴇ Hɪsᴛᴏʀʏ ➪ 0 ᴘᴄs")
+        lines.append("")
+
+    lines.append("▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔")
+    lines.append(f"☞︎︎︎ Tᴏᴛᴀʟ Dᴜᴇ ➪ {format_money_amount(finance['due'])} Tᴋ")
+    await event.reply("\n".join(lines))
+
+
+async def clear_user_due_command(event, target_user_id: int):
+    """Clear a user's due amount and purchase summary."""
+    async with STATE_LOCK:
+        ensure_user_finance_record(target_user_id)
+        finance = USER_FINANCE[target_user_id]
+        cleared_due = Decimal(finance.get('due', '0'))
+        finance['due'] = '0'
+        finance['purchases'] = {}
+        save_state()
+
+        profile = USER_PROFILES.get(target_user_id, {}).copy()
+
+    customer_name = profile.get('name') or (f"@{profile['username']}" if profile.get('username') else str(target_user_id))
+    await event.reply(
+        f"- Dᴜᴇ Cʟᴇᴀʀ Oғ {customer_name} !\n\n"
+        f"- Dᴜᴇ Aᴍᴍᴏᴜɴᴛ : {format_money_amount(cleared_due)} Tᴋ \n\n"
+        "Tʜᴀɴᴋs Fᴏʀ Yᴏᴜʀ Sᴜᴘᴘᴏʀᴛ ❤️❤️"
+    )
+
+
+async def set_user_balance_command(event, target_user_id: int, amount: Decimal):
+    """Set a user's balance amount."""
+    async with STATE_LOCK:
+        set_user_balance(target_user_id, amount)
+        save_state()
+        profile = USER_PROFILES.get(target_user_id, {}).copy()
+
+    customer_name = profile.get('name') or (f"@{profile['username']}" if profile.get('username') else str(target_user_id))
+    await event.reply(
+        f"✅ Bᴀʟᴀɴᴄᴇ Uᴘᴅᴀᴛᴇᴅ Oғ {customer_name} !\n\n"
+        f"💳 Bᴀʟᴀɴᴄᴇ Aᴍᴏᴜɴᴛ : {format_money_amount(amount)} Tᴋ"
+    )
+
+
+async def purchase_uc_with_due(event, owner_user_id: int, target_user_id: int, category: str, quantity: int):
+    """Sell UC stock to a branch user using their due limit."""
+    if quantity <= 0:
+        await event.reply("❌ Quantity must be at least 1.")
+        return
+
+    async with STATE_LOCK:
+        ensure_user_finance_record(target_user_id)
+        counts, _ = get_branch_stock_snapshot(owner_user_id)
+        available_stock = counts.get(category, 0)
+        if available_stock < quantity:
+            await event.reply(
+                f"❌ Not enough stock.\n"
+                f"➪ Category : {category} UC\n"
+                f"➪ Need     : {quantity}\n"
+                f"➪ Stock    : {available_stock}"
+            )
+            return
+
+        unit_price = get_branch_rate(owner_user_id, category)
+        if unit_price <= 0:
+            await event.reply(f"❌ Rate for `{category} UC` is not set.")
+            return
+
+        finance = USER_FINANCE[target_user_id]
+        current_due = Decimal(finance.get('due', '0'))
+        due_limit = Decimal(finance.get('due_limit', '0'))
+        total_price = unit_price * Decimal(quantity)
+        if current_due + total_price > due_limit:
+            await event.reply(
+                "❌ Due limit exceeded.\n"
+                f"➪ Current Due : {format_money_amount(current_due)} Tk\n"
+                f"➪ Due Limit   : {format_money_amount(due_limit)} Tk\n"
+                f"➪ Need More   : {format_money_amount((current_due + total_price) - due_limit)} Tk"
+            )
+            return
+
+        codes = pop_branch_stock_entries(owner_user_id, category, quantity)
+        if len(codes) != quantity:
+            await event.reply("❌ Could not reserve the requested stock. Please try again.")
+            return
+
+        finance['due'] = str(current_due + total_price)
+        increment_user_purchase(target_user_id, category, quantity)
+        save_state()
+
+    profile = USER_PROFILES.get(target_user_id, {})
+    buyer_name = profile.get('name') or (f"@{profile['username']}" if profile.get('username') else str(target_user_id))
+    code_lines = []
+    for index, item in enumerate(codes, start=1):
+        number_emoji = f"{index}️⃣" if index <= 9 else f"{index}."
+        code_lines.append(
+            f"{number_emoji} {item['code_head']}\n"
+            f"    {item['code_tail']}"
+        )
+    await event.reply(
+        "✅ 𝗗𝘂𝗲 𝗢𝗿𝗱𝗲𝗿 𝗦𝘂𝗰𝗰𝗲𝘀𝘀𝗳𝘂𝗹\n\n"
+        f"👤 Buyer    : {buyer_name}\n"
+        f"📦 Product  : {category} UC\n"
+        f"🔢 Quantity : {quantity}\n"
+        f"💸 Price    : {format_money_amount(total_price)} Tk\n"
+        f"🧾 total Due  : {format_money_amount(Decimal(finance['due']))} Tk\n\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "🔑 Codes:\n\n"
+        + "\n\n".join(code_lines)
+        + "\n━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+async def call_ucbot_topup_api(order_id: str, player_id: str, codes: list[str]) -> tuple[dict | None, str | None, float]:
+    """Call the external UcBot topup API."""
+    started = asyncio.get_running_loop().time()
+    if not UCBOT_AUTH_TOKEN:
+        return None, "Missing `UCBOT_AUTH_TOKEN` in environment.", 0.0
+
+    headers = {
+        'Authorization': UCBOT_AUTH_TOKEN,
+        'Content-Type': 'application/json',
+    }
+    payload = {
+        'orderid': order_id,
+        'playerid': player_id,
+        'code': ",".join(codes),
+    }
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(UCBOT_TOPUP_URL, headers=headers, json=payload) as response:
+                duration = asyncio.get_running_loop().time() - started
+                if response.status != 200:
+                    response_text = await response.text()
+                    return None, f"HTTP {response.status}: {response_text[:300]}", duration
+                return await response.json(), None, duration
+    except Exception as e:
+        duration = asyncio.get_running_loop().time() - started
+        return None, str(e), duration
+
+
+def next_topup_order_id() -> str:
+    """Allocate the next sequential topup order id."""
+    global TOPUP_ORDER_SEQ
+    TOPUP_ORDER_SEQ += 1
+    return str(TOPUP_ORDER_SEQ)
+
+
+async def topup_with_uc_codes(event, owner_user_id: int, target_user_id: int, uid: str, diamond_key: str, quantity: int):
+    """Use reserved UC stock to top up a player through the external API."""
+    product = TOPUP_PRODUCT_MAP[diamond_key]
+    category = product['category']
+    product_label = product['label']
+    fee_per_unit = product['fee']
+    processing_msg = await event.reply(
+        f"⏳ Processing {product_label} topup...\n"
+        f"UID: `{uid}`\n"
+        f"Quantity: `{quantity}`"
+    )
+
+    if quantity <= 0 or quantity > 5:
+        await processing_msg.edit("❌ Quantity must be between 1 and 5.")
+        return
+
+    async with STATE_LOCK:
+        ensure_user_finance_record(target_user_id)
+        counts, _ = get_branch_stock_snapshot(owner_user_id)
+        available_stock = counts.get(category, 0)
+        if available_stock < quantity:
+            await processing_msg.edit(
+                f"❌ Not enough stock.\n"
+                f"➪ Category : {category} UC\n"
+                f"➪ Need     : {quantity}\n"
+                f"➪ Stock    : {available_stock}"
+            )
+            return
+
+        unit_price = get_branch_rate(owner_user_id, category)
+        if unit_price <= 0:
+            await processing_msg.edit(f"❌ Rate for `{category} UC` is not set.")
+            return
+
+        finance = USER_FINANCE[target_user_id]
+        current_due = Decimal(finance.get('due', '0'))
+        due_limit = Decimal(finance.get('due_limit', '0'))
+        total_price = (unit_price + fee_per_unit) * Decimal(quantity)
+        if current_due + total_price > due_limit:
+            await processing_msg.edit(
+                "❌ Due limit exceeded.\n"
+                f"➪ Current Due : {format_money_amount(current_due)} Tk\n"
+                f"➪ Due Limit   : {format_money_amount(due_limit)} Tk\n"
+                f"➪ Need More   : {format_money_amount((current_due + total_price) - due_limit)} Tk"
+            )
+            return
+
+        reserved_entries, reserved_tokens = reserve_branch_stock_entries(owner_user_id, category, quantity)
+        if len(reserved_entries) != quantity:
+            await processing_msg.edit("❌ Could not reserve the requested stock. Please try again.")
+            return
+
+        order_id = next_topup_order_id()
+        save_state()
+
+    codes = [f"{item['code_head']} {item['code_tail']}" for item in reserved_entries]
+    response_json, error_message, duration = await call_ucbot_topup_api(order_id, uid, codes)
+
+    if error_message or not response_json:
+        async with STATE_LOCK:
+            restore_branch_stock_tokens(owner_user_id, category, reserved_tokens)
+            save_state()
+        await processing_msg.edit(f"❌ Topup API failed.\nError: `{error_message or 'Unknown error'}`")
+        return
+
+    batch = response_json.get('batch') or []
+    success_entries = []
+    failed_entries = []
+
+    for index, entry in enumerate(batch):
+        code_text = str(entry.get('uc', '')).strip()
+        detail = str(entry.get('detail', '')).strip() or "Unknown"
+        ok = bool(entry.get('ok'))
+        if ok:
+            success_entries.append({'code': code_text, 'detail': detail})
+        else:
+            failed_entries.append({'code': code_text, 'detail': detail})
+
+    async with STATE_LOCK:
+        finance = USER_FINANCE[target_user_id]
+        old_due = Decimal(finance.get('due', '0'))
+        successful_units = len(success_entries)
+        charged_units = quantity
+        charged_total = (unit_price + fee_per_unit) * Decimal(charged_units)
+        finance['due'] = str(old_due + charged_total)
+        increment_user_purchase(target_user_id, category, charged_units)
+        save_state()
+        total_due = Decimal(finance['due'])
+        profile = USER_PROFILES.get(target_user_id, {}).copy()
+
+    username = response_json.get('username') or profile.get('name') or (f"@{profile['username']}" if profile.get('username') else str(target_user_id))
+    batch_lines = []
+    for item in success_entries + failed_entries:
+        batch_lines.append(f"{item['code']}  {item['detail']}")
+
+    if successful_units == quantity and quantity > 0:
+        status_header = f"✅ {product_label} 💎 TOPUP DONE"
+        status_footer = "✅ আপনার Top-Up সম্পন্ন হয়েছে 🎉"
+    elif successful_units > 0:
+        status_header = f"⚠️ {product_label} 💎 TOPUP PARTIAL"
+        status_footer = "⚠️ আপনার Top-Up আংশিক সম্পন্ন হয়েছে"
+    else:
+        status_header = f"❌ {product_label} 💎 TOPUP FAILED"
+        status_footer = "❌ আপনার Top-Up সম্পন্ন হয়নি"
+
+    final_message = (
+        f"{status_header}\n"
+        "┌──────────────────────────┐\n"
+        f"│ Order ID : #{order_id}\n"
+        f"│ User     : {username}\n"
+        f"│ UID      : {uid}\n"
+        "└──────────────────────────┘\n"
+        + ("\n".join(batch_lines) if batch_lines else "No batch details returned.")
+        + "\n┌──────────────────────────┐\n"
+        f"│ Charge : {format_money_amount(charged_total)} ৳ ({format_money_amount(fee_per_unit)}৳ Fee/Unit)\n"
+        "│\n"
+        f"│ {product_label}  : {successful_units}x\n"
+        f"│ Failed : {len(failed_entries)}x\n"
+        f"│ due Charge : {format_money_amount(charged_total)}৳ \n"
+        f"│ Total Due  : {format_money_amount(old_due)} + {format_money_amount(charged_total)} = {format_money_amount(total_due)}৳ \n"
+        "│ \n"
+        f"│ Duration : {duration:.2f}s\n"
+        "└── 🤖 Powered by TelegonBot ───┘\n\n"
+        f"{status_footer}"
+    )
+    try:
+        await processing_msg.edit(final_message)
+    except Exception:
+        await event.reply(final_message)
 
 
 async def start_super_admin_verification(event, target_user_id: int):
@@ -1113,6 +2195,46 @@ async def help_command_handler(event):
     
 🛠 **Admin Commands**
 
+- `setPrefix R`
+  ➤ admin / super admin / owner নিজের branch prefix set করবে
+  উদাহরণ: `setPrefix R`
+
+- `Rsignup`
+  ➤ private chat-এ এই command send করলে ওই user আপনার branch-এর নিচে register হবে
+  নোট: এটা শুধু owner / super admin use করতে পারবে
+  উদাহরণ: private chat-এ `Rsignup`
+
+- `Rsignout`
+  ➤ private chat-এ এই command send করলে ওই user আপনার branch থেকে remove হবে
+
+- `Rduelimit 200`
+  ➤ private chat-এ target user-এর due limit set করবে
+
+- `Rbalance`
+  ➤ নিজের due, balance, due limit card দেখাবে
+  ➤ owner / super admin `Rbalance 200` দিয়ে target user-এর balance set করতে পারবে
+
+- `Rstock`
+  ➤ নিজের branch-এর UC stock summary দেখাবে
+
+- `Rstockadd`
+  ➤ command-এর পরে UC code paste করলে auto category-wise stock add হবে
+
+- `Rrate`
+  ➤ নিজের branch-এর সব UC rate list দেখাবে
+
+- `R20 19`
+  ➤ owner / super admin নিজের branch-এর 20 UC rate set করবে
+
+- `Rdue 20` / `Rdue 20 2`
+  ➤ due limit ব্যবহার করে stock থেকে UC code কিনবে
+
+- `Rclear`
+  ➤ admin / super admin registered user-এর due clear করবে
+
+- `Rtp <uid> <diamond> [qty]`
+  ➤ UC code দিয়ে direct topup করবে, max quantity `5`
+
 - `setadmin @username`
   ➤ নিজের branch-এর নিচে নতুন normal admin বানাবে
   উদাহরণ: `setadmin @testuser`
@@ -1497,7 +2619,8 @@ async def myaccess_command_handler(event):
         f"👤 User ID: `{sender_id}`\n"
         f"🏷 Username: `{('@' + sender_username) if sender_username else 'N/A'}`\n"
         f"🛡 Role: `{role}`\n"
-        f"👤 Manager ID: `{get_manager_id(sender_id) or 'N/A'}`"
+        f"👤 Manager ID: `{get_manager_id(sender_id) or 'N/A'}`\n"
+        f"🔑 Prefix: `{get_manager_prefix(sender_id) or 'Not set'}`"
     )
 
 
@@ -1604,7 +2727,279 @@ async def calculator_message_handler(event):
         print(f"⚠️ Calculator handler error for `{expression}`: {e}")
 
 
+async def prefix_command_handler(event):
+    """Handle dynamic setPrefix and branch-aware prefixed commands."""
+    if not getattr(event, 'raw_text', None):
+        return
+
+    text = event.raw_text.strip()
+    if not text:
+        return
+
+    setprefix_match = re.match(r'(?i)^/?setprefix\s+(\S)$', text)
+    if setprefix_match:
+        await log_access_check(event, "setprefix")
+        if not await can_set_prefix(event):
+            await event.reply(await build_access_denied_message(event, "Admin", "setprefix"))
+            return
+
+        prefix = setprefix_match.group(1)
+        actor_user_id, _ = await get_sender_identity(event)
+        async with STATE_LOCK:
+            set_manager_prefix(actor_user_id, prefix)
+            save_state()
+        await event.reply(f"✅ 𝗣𝗿𝗲𝗳𝗶𝘅 `{prefix}` 𝗮𝗹𝗶𝘃𝗲")
+        return
+
+    if not event.is_private:
+        return
+
+    sender_id, _ = await get_sender_identity(event)
+    command_match = re.match(r'(?is)^([A-Za-z])(\w+)(?:\s+([\s\S]+))?$', text)
+    if not command_match:
+        return
+
+    prefix = command_match.group(1)
+    action = command_match.group(2).lower()
+    argument_text = (command_match.group(3) or '').strip()
+    prefix_owner_id = resolve_prefix_owner_for_user(sender_id, prefix)
+    if prefix_owner_id is None:
+        return
+
+    try:
+        private_chat = await event.get_chat()
+    except Exception as e:
+        await event.reply(f"❌ Could not resolve private chat user.\nError: `{e}`")
+        return
+
+    target_user_id = getattr(private_chat, 'id', None)
+    if target_user_id is None:
+        await event.reply("❌ Could not detect the target user in this private chat.")
+        return
+
+    async with STATE_LOCK:
+        cache_entity_profile(private_chat)
+        save_state()
+
+    if action == "signup":
+        if prefix_owner_id != sender_id:
+            return
+
+        await log_access_check(event, "prefixsignup")
+        if not await can_use_signup_prefix(event):
+            await event.reply(await build_access_denied_message(event, "Admin", "prefixsignup"))
+            return
+        await register_user_under_manager(event, int(target_user_id))
+        return
+
+    if action == "signout":
+        if prefix_owner_id != sender_id:
+            return
+
+        await log_access_check(event, "prefixsignout")
+        if not await can_use_signup_prefix(event):
+            await event.reply(await build_access_denied_message(event, "Admin", "prefixsignout"))
+            return
+        if not is_registered_under_branch(prefix_owner_id, int(target_user_id)):
+            await event.reply("❌ This user is not registered under your branch.")
+            return
+        await signout_user_from_manager(event, int(target_user_id))
+        return
+
+    if action == "duelimit":
+        if prefix_owner_id != sender_id:
+            return
+
+        await log_access_check(event, "prefixduelimit")
+        if not await can_manage_due_limit(event):
+            await event.reply(await build_access_denied_message(event, "Admin", "prefixduelimit"))
+            return
+
+        if not argument_text:
+            await event.reply("❌ Invalid format.\nUsage: `prefixduelimit 200`")
+            return
+
+        try:
+            amount = Decimal(argument_text)
+        except InvalidOperation:
+            await event.reply("❌ Invalid amount. Example: `Aduelimit 200`")
+            return
+
+        if amount < 0:
+            await event.reply("❌ Due limit cannot be negative.")
+            return
+        if not is_registered_under_branch(prefix_owner_id, int(target_user_id)):
+            await event.reply("❌ This user is not registered under your branch.")
+            return
+
+        await set_due_limit_for_managed_user(event, int(target_user_id), amount)
+        return
+
+    if action == "balance":
+        if not is_registered_under_branch(prefix_owner_id, int(target_user_id)):
+            await event.reply("❌ This user is not registered under your branch.")
+            return
+        if argument_text:
+            if prefix_owner_id != sender_id:
+                return
+
+            await log_access_check(event, "prefixsetbalance")
+            if not await can_use_signup_prefix(event):
+                await event.reply(await build_access_denied_message(event, "Super Admin", "prefixsetbalance"))
+                return
+
+            try:
+                amount = Decimal(argument_text)
+            except InvalidOperation:
+                await event.reply(f"❌ Invalid amount. Example: `{prefix}balance 200`")
+                return
+
+            if amount < 0:
+                await event.reply("❌ Balance cannot be negative.")
+                return
+
+            await set_user_balance_command(event, int(target_user_id), amount)
+            return
+        await send_balance_card(event, int(target_user_id))
+        return
+
+    if action == "stock":
+        if not is_registered_under_branch(prefix_owner_id, int(sender_id)):
+            await event.reply("❌ You are not registered under this branch.")
+            return
+        await send_stock_card(event, prefix_owner_id)
+        return
+
+    if action == "stockadd":
+        if prefix_owner_id != sender_id:
+            return
+
+        await log_access_check(event, "prefixstockadd")
+        if not await can_use_signup_prefix(event):
+            await event.reply(await build_access_denied_message(event, "Super Admin", "prefixstockadd"))
+            return
+
+        if not argument_text:
+            await event.reply("❌ Invalid format.\nUsage: `Astockadd <paste uc codes>`")
+            return
+
+        await add_branch_stock_from_text(event, prefix_owner_id, argument_text)
+        return
+
+    if action == "help":
+        if not is_registered_under_branch(prefix_owner_id, int(sender_id)):
+            await event.reply("❌ You are not registered under this branch.")
+            return
+        await send_prefix_help_card(event, prefix, prefix_owner_id, int(sender_id))
+        return
+
+    if action == "rate":
+        if not is_registered_under_branch(prefix_owner_id, int(sender_id)):
+            await event.reply("❌ You are not registered under this branch.")
+            return
+        await send_rate_card(event, prefix_owner_id)
+        return
+
+    if action == "due":
+        if not is_registered_under_branch(prefix_owner_id, int(target_user_id)):
+            await event.reply("❌ This user is not registered under your branch.")
+            return
+
+        parts = argument_text.split() if argument_text else []
+        if not parts:
+            await send_due_summary_card(event, int(target_user_id))
+            return
+
+        category = parts[0]
+        if category not in UC_STOCK_CATEGORY_ORDER:
+            await event.reply("❌ Invalid UC category.")
+            return
+
+        quantity = 1
+        if len(parts) >= 2:
+            if not parts[1].isdigit():
+                await event.reply("❌ Quantity must be a whole number.")
+                return
+            quantity = int(parts[1])
+
+        await purchase_uc_with_due(event, prefix_owner_id, int(target_user_id), category, quantity)
+        return
+
+    if action == "clear":
+        if prefix_owner_id != sender_id:
+            return
+
+        await log_access_check(event, "prefixclear")
+        if not await can_manage_due_limit(event):
+            await event.reply(await build_access_denied_message(event, "Admin", "prefixclear"))
+            return
+
+        if not is_registered_under_branch(prefix_owner_id, int(target_user_id)):
+            await event.reply("❌ This user is not registered under your branch.")
+            return
+
+        await clear_user_due_command(event, int(target_user_id))
+        return
+
+    if action == "tp":
+        if not is_registered_under_branch(prefix_owner_id, int(target_user_id)):
+            await event.reply("❌ This user is not registered under your branch.")
+            return
+
+        parts = argument_text.split() if argument_text else []
+        if len(parts) < 2:
+            await event.reply(f"❌ Invalid format.\nUsage: `{prefix}tp <uid> <diamond> [qty]`")
+            return
+
+        uid = parts[0].strip()
+        if not uid.isdigit():
+            await event.reply("❌ UID must be numeric.")
+            return
+
+        diamond_input = parts[1].strip().lower()
+        diamond_key = TOPUP_DIAMOND_ALIASES.get(diamond_input)
+        if diamond_key is None:
+            await event.reply("❌ Invalid topup amount. Supported: 25, 50, 115, 240, 161/weekly, 610, 800/monthly, 1240, 2530.")
+            return
+
+        quantity = 1
+        if len(parts) >= 3:
+            if not parts[2].isdigit():
+                await event.reply("❌ Quantity must be a whole number.")
+                return
+            quantity = int(parts[2])
+
+        await topup_with_uc_codes(event, prefix_owner_id, int(target_user_id), uid, diamond_key, quantity)
+        return
+
+    if action in set(UC_STOCK_CATEGORY_ORDER):
+        if prefix_owner_id != sender_id:
+            return
+
+        await log_access_check(event, "prefixsetrate")
+        if not await can_use_signup_prefix(event):
+            await event.reply(await build_access_denied_message(event, "Super Admin", "prefixsetrate"))
+            return
+
+        if not argument_text:
+            await event.reply(f"❌ Invalid format.\nUsage: `{prefix}{action} 19`")
+            return
+
+        try:
+            price = Decimal(argument_text)
+        except InvalidOperation:
+            await event.reply(f"❌ Invalid price. Example: `{prefix}{action} 19`")
+            return
+
+        if price < 0:
+            await event.reply("❌ Rate cannot be negative.")
+            return
+
+        await set_branch_rate_command(event, prefix_owner_id, action, price)
+
+
 client.add_event_handler(calculator_message_handler, events.NewMessage)
+client.add_event_handler(prefix_command_handler, events.NewMessage)
 
 
 HANDLER_SPECS = [
@@ -1629,6 +3024,7 @@ def register_handlers(target_client):
     for handler, pattern in HANDLER_SPECS:
         target_client.add_event_handler(handler, events.NewMessage(pattern=pattern))
     target_client.add_event_handler(calculator_message_handler, events.NewMessage)
+    target_client.add_event_handler(prefix_command_handler, events.NewMessage)
 
 
 async def start_super_admin_clients():
