@@ -558,15 +558,18 @@ async def remove_admin_for_user(event, target_user_id: int):
 
 async def start_super_admin_verification(event, target_user_id: int):
     """Start super admin verification flow for a user."""
+    actor_user_id, _ = await get_sender_identity(event)
+    actor_is_owner = await is_owner(event)
     existing_manager_id = get_manager_id(target_user_id)
-    if existing_manager_id is not None and existing_manager_id != event.sender_id:
+
+    if existing_manager_id is not None and existing_manager_id != actor_user_id and not actor_is_owner:
         await event.reply(
             f"❌ User `{target_user_id}` already belongs to manager `{existing_manager_id}`."
         )
         return
 
-    PENDING_SUPER_ADMINS[target_user_id] = event.sender_id
-    set_manager_for_user(target_user_id, event.sender_id)
+    PENDING_SUPER_ADMINS[target_user_id] = actor_user_id
+    set_manager_for_user(target_user_id, actor_user_id)
     save_state()
     await event.reply(
         f"✅ Super admin request started for user `{target_user_id}`\n"
