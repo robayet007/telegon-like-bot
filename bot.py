@@ -2836,7 +2836,8 @@ async def prefix_command_handler(event):
         return
 
     if action == "balance":
-        if not is_registered_under_branch(prefix_owner_id, int(target_user_id)):
+        branch_user_id = int(sender_id)
+        if not is_registered_under_branch(prefix_owner_id, branch_user_id):
             await event.reply("❌ This user is not registered under your branch.")
             return
         if argument_text:
@@ -2860,7 +2861,7 @@ async def prefix_command_handler(event):
 
             await set_user_balance_command(event, int(target_user_id), amount)
             return
-        await send_balance_card(event, int(target_user_id))
+        await send_balance_card(event, branch_user_id)
         return
 
     if action == "stock":
@@ -2901,13 +2902,14 @@ async def prefix_command_handler(event):
         return
 
     if action == "due":
-        if not is_registered_under_branch(prefix_owner_id, int(target_user_id)):
+        branch_user_id = int(sender_id)
+        if not is_registered_under_branch(prefix_owner_id, branch_user_id):
             await event.reply("❌ This user is not registered under your branch.")
             return
 
         parts = argument_text.split() if argument_text else []
         if not parts:
-            await send_due_summary_card(event, int(target_user_id))
+            await send_due_summary_card(event, branch_user_id)
             return
 
         category = parts[0]
@@ -2922,7 +2924,7 @@ async def prefix_command_handler(event):
                 return
             quantity = int(parts[1])
 
-        await purchase_uc_with_due(event, prefix_owner_id, int(target_user_id), category, quantity)
+        await purchase_uc_with_due(event, prefix_owner_id, branch_user_id, category, quantity)
         return
 
     if action == "clear":
@@ -2942,7 +2944,8 @@ async def prefix_command_handler(event):
         return
 
     if action == "tp":
-        if not is_registered_under_branch(prefix_owner_id, int(target_user_id)):
+        branch_user_id = int(sender_id)
+        if not is_registered_under_branch(prefix_owner_id, branch_user_id):
             await event.reply("❌ This user is not registered under your branch.")
             return
 
@@ -2969,7 +2972,7 @@ async def prefix_command_handler(event):
                 return
             quantity = int(parts[2])
 
-        await topup_with_uc_codes(event, prefix_owner_id, int(target_user_id), uid, diamond_key, quantity)
+        await topup_with_uc_codes(event, prefix_owner_id, branch_user_id, uid, diamond_key, quantity)
         return
 
     if action in set(UC_STOCK_CATEGORY_ORDER):
