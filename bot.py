@@ -2,6 +2,7 @@ import os
 import asyncio
 import re
 import json
+from decimal import Decimal, InvalidOperation, getcontext
 from datetime import datetime
 from pathlib import Path
 from pymongo import MongoClient
@@ -78,6 +79,145 @@ mongo_client = None
 mongo_db = None
 state_collection = None
 DASHBOARD_DIR = Path(__file__).resolve().parent
+getcontext().prec = 28
+
+CALCULATOR_ALLOWED_PATTERN = re.compile(r'^[\d\s+\-*/().%]+$')
+CALCULATOR_TOKEN_PATTERN = re.compile(r'\d+(?:\.\d+)?|[()+\-*/%]')
+
+
+class CalculatorError(Exception):
+    """Raised when a calculator expression cannot be parsed safely."""
+
+
+class CalculatorValue:
+    """Stores a numeric value and whether it came from a percent literal."""
+
+    def __init__(self, value: Decimal, is_percent: bool = False):
+        self.value = value
+        self.is_percent = is_percent
+
+
+class CalculatorParser:
+    """Minimal safe parser for +, -, *, /, (), and postfix %."""
+
+    def __init__(self, expression: str):
+        self.tokens = CALCULATOR_TOKEN_PATTERN.findall(expression.replace(' ', ''))
+        self.index = 0
+
+    def parse(self) -> Decimal:
+        if not self.tokens:
+            raise CalculatorError("Empty expression")
+
+        result = self.parse_expression()
+        if self.index != len(self.tokens):
+            raise CalculatorError("Unexpected token")
+        return result.value
+
+    def current_token(self) -> str | None:
+        if self.index >= len(self.tokens):
+            return None
+        return self.tokens[self.index]
+
+    def consume_token(self) -> str | None:
+        token = self.current_token()
+        if token is not None:
+            self.index += 1
+        return token
+
+    def parse_expression(self) -> CalculatorValue:
+        left = self.parse_term()
+
+        while self.current_token() in {'+', '-'}:
+            operator = self.consume_token()
+            right = self.parse_term()
+
+            if operator == '+':
+                if right.is_percent:
+                    left = CalculatorValue(left.value + (left.value * right.value))
+                else:
+                    left = CalculatorValue(left.value + right.value)
+            else:
+                if right.is_percent:
+                    left = CalculatorValue(left.value - (left.value * right.value))
+                else:
+                    left = CalculatorValue(left.value - right.value)
+
+        return left
+
+    def parse_term(self) -> CalculatorValue:
+        left = self.parse_factor()
+
+        while self.current_token() in {'*', '/'}:
+            operator = self.consume_token()
+            right = self.parse_factor()
+
+            if operator == '*':
+                left = CalculatorValue(left.value * right.value)
+            else:
+                if right.value == 0:
+                    raise CalculatorError("Division by zero")
+                left = CalculatorValue(left.value / right.value)
+
+        return left
+
+    def parse_factor(self) -> CalculatorValue:
+        token = self.current_token()
+
+        if token in {'+', '-'}:
+            operator = self.consume_token()
+            value = self.parse_factor()
+            if operator == '-':
+                return CalculatorValue(-value.value, is_percent=value.is_percent)
+            return value
+
+        if token == '(':
+            self.consume_token()
+            value = self.parse_expression()
+            if self.consume_token() != ')':
+                raise CalculatorError("Missing closing parenthesis")
+        else:
+            if token is None:
+                raise CalculatorError("Unexpected end of expression")
+
+            self.consume_token()
+            try:
+                value = CalculatorValue(Decimal(token))
+            except InvalidOperation as exc:
+                raise CalculatorError("Invalid number") from exc
+
+        while self.current_token() == '%':
+            self.consume_token()
+            value = CalculatorValue(value.value / Decimal('100'), is_percent=True)
+
+        return value
+
+
+def is_calculator_expression(text: str) -> bool:
+    """Return True when the message looks like a plain arithmetic expression."""
+    candidate = text.strip()
+    if not candidate or candidate.startswith('/'):
+        return False
+    if '\n' in candidate or '\r' in candidate:
+        return False
+    if not any(ch.isdigit() for ch in candidate):
+        return False
+    if not CALCULATOR_ALLOWED_PATTERN.fullmatch(candidate):
+        return False
+    return any(op in candidate for op in ('+', '-', '*', '/', '%', '(', ')'))
+
+
+def evaluate_calculator_expression(expression: str) -> Decimal:
+    """Safely evaluate a calculator expression."""
+    parser = CalculatorParser(expression)
+    return parser.parse()
+
+
+def format_calculator_result(value: Decimal) -> str:
+    """Render Decimal results without unnecessary trailing zeroes."""
+    normalized = value.normalize()
+    if normalized == normalized.to_integral():
+        return str(normalized.quantize(Decimal('1')))
+    return format(normalized, 'f').rstrip('0').rstrip('.')
 
 
 def init_mongodb():
@@ -1446,6 +1586,27 @@ async def alllimit_command_handler(event):
     await event.reply(msg)
 
 
+async def calculator_message_handler(event):
+    """Auto-calculate plain arithmetic messages in chats and groups."""
+    if not getattr(event, 'raw_text', None):
+        return
+
+    expression = event.raw_text.strip()
+    if not is_calculator_expression(expression):
+        return
+
+    try:
+        result = evaluate_calculator_expression(expression)
+        await event.reply(f"`= {format_calculator_result(result)}`")
+    except CalculatorError:
+        return
+    except Exception as e:
+        print(f"⚠️ Calculator handler error for `{expression}`: {e}")
+
+
+client.add_event_handler(calculator_message_handler, events.NewMessage)
+
+
 HANDLER_SPECS = [
     (like_command_handler, r'(?i)^/?like\s+(\d+)\s+(100|200)$'),
     (start_command_handler, r'(?i)^/?start$'),
@@ -1467,6 +1628,7 @@ def register_handlers(target_client):
     """Attach all command handlers to a Telegram client."""
     for handler, pattern in HANDLER_SPECS:
         target_client.add_event_handler(handler, events.NewMessage(pattern=pattern))
+    target_client.add_event_handler(calculator_message_handler, events.NewMessage)
 
 
 async def start_super_admin_clients():
