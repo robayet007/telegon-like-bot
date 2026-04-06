@@ -2061,7 +2061,7 @@ async def call_ff_api(uid, like_type: int):
         }
 
 
-@client.on(events.NewMessage(pattern=r'(?i)^/?like\s+(\d+)\s+(100|200)$'))
+@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?like\s+(\d+)\s+(100|200)$'))
 async def like_command_handler(event):
     """Handle like <uid> <100|200> command."""
     match = re.match(r'(?i)^/?like\s+(\d+)\s+(100|200)$', event.raw_text.strip())
@@ -2127,7 +2127,7 @@ async def like_command_handler(event):
             await event.reply(formatted_message)
 
 
-@client.on(events.NewMessage(pattern=r'(?i)^/?start$'))
+@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?start$'))
 async def start_command_handler(event):
     """Handle start command - works in both groups and private (with or without /)"""
     is_group = not event.is_private
@@ -2160,7 +2160,7 @@ Send likes to Free Fire players using their UID.
     await event.reply(help_message)
 
 
-@client.on(events.NewMessage(pattern=r'(?i)^/?help$'))
+@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?help$'))
 async def help_command_handler(event):
     """Handle help command - works in both groups and private (with or without /)"""
     is_group = not event.is_private
@@ -2305,7 +2305,7 @@ async def help_command_handler(event):
 # =========================
 
 
-@client.on(events.NewMessage(pattern=r'(?i)^/?setadmin\s+(@?\w+)$'))
+@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?setadmin\s+(@?\w+)$'))
 async def setadmin_command_handler(event):
     """
     Promote a user to admin.
@@ -2338,7 +2338,7 @@ async def setadmin_command_handler(event):
     await set_admin_for_user(event, target_user_id)
 
 
-@client.on(events.NewMessage(pattern=r'(?i)^/?removeadmin\s+(@?\w+)$'))
+@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?removeadmin\s+(@?\w+)$'))
 async def removeadmin_command_handler(event):
     """
     Remove a normal admin.
@@ -2371,7 +2371,7 @@ async def removeadmin_command_handler(event):
     await remove_admin_for_user(event, target_user_id)
 
 
-@client.on(events.NewMessage(pattern=r'(?i)^/?setsuperadmin\s+(@?\w+)$'))
+@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?setsuperadmin\s+(@?\w+)$'))
 async def setsuperadmin_command_handler(event):
     """
     Start super admin verification for a user.
@@ -2404,7 +2404,7 @@ async def setsuperadmin_command_handler(event):
     await start_super_admin_verification(event, target_user_id)
 
 
-@client.on(events.NewMessage(pattern=r'(?i)^/?superauth\s+(\d+)\s+([A-Za-z0-9]+)\s+(.+)$'))
+@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?superauth\s+(\d+)\s+([A-Za-z0-9]+)\s+(.+)$'))
 async def superauth_command_handler(event):
     """
     Submit credentials for pending super admin verification.
@@ -2435,7 +2435,7 @@ async def superauth_command_handler(event):
             await event.reply(f"❌ Super admin verification error.\nError: `{e}`")
 
 
-@client.on(events.NewMessage(pattern=r'(?i)^/?setlimit\s+(\d+)(?:\s+(@?\w+))?\s+(100|200)$'))
+@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?setlimit\s+(\d+)(?:\s+(@?\w+))?\s+(100|200)$'))
 async def setlimit_command_handler(event):
     """
     Set monthly limit for a user.
@@ -2479,7 +2479,7 @@ async def setlimit_command_handler(event):
     await set_limit_for_user(event, target_user_id, limit, like_type)
 
 
-@client.on(events.NewMessage(pattern=r'(?i)^/?setsplimit\s+(\d+)\s+(@?\w+)\s+(100|200)$'))
+@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?setsplimit\s+(\d+)\s+(@?\w+)\s+(100|200)$'))
 async def setsplimit_command_handler(event):
     """
     Set a super admin pool limit.
@@ -2522,7 +2522,7 @@ async def setsplimit_command_handler(event):
     )
 
 
-@client.on(events.NewMessage(pattern=r'(?i)^/?resetlimit(?:\s+(@?\w+))?$'))
+@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?resetlimit(?:\s+(@?\w+))?$'))
 async def resetlimit_command_handler(event):
     """
     Reset this month's usage counter for a user.
@@ -2561,7 +2561,7 @@ async def resetlimit_command_handler(event):
     await reset_monthly_usage_for_user(event, target_user_id)
 
 
-@client.on(events.NewMessage(pattern=r'(?i)^/?mylimit$'))
+@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?mylimit$'))
 async def mylimit_command_handler(event):
     """
     Show current limit and this month's usage for the caller.
@@ -2596,7 +2596,7 @@ async def mylimit_command_handler(event):
     await event.reply("\n".join(lines))
 
 
-@client.on(events.NewMessage(pattern=r'(?i)^/?myaccess$'))
+@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?myaccess$'))
 async def myaccess_command_handler(event):
     """Show the sender's current access level."""
     await log_access_check(event, "myaccess")
@@ -2624,7 +2624,7 @@ async def myaccess_command_handler(event):
     )
 
 
-@client.on(events.NewMessage(pattern=r'(?i)^/?alllimit$'))
+@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?alllimit$'))
 async def alllimit_command_handler(event):
     """
     Show this month's usage & limits only for the caller's own branch.
@@ -2998,8 +2998,8 @@ async def prefix_command_handler(event):
         await set_branch_rate_command(event, prefix_owner_id, action, price)
 
 
-client.add_event_handler(calculator_message_handler, events.NewMessage)
-client.add_event_handler(prefix_command_handler, events.NewMessage)
+client.add_event_handler(calculator_message_handler, events.NewMessage(outgoing=True))
+client.add_event_handler(prefix_command_handler, events.NewMessage(outgoing=True))
 
 
 HANDLER_SPECS = [
@@ -3022,9 +3022,9 @@ HANDLER_SPECS = [
 def register_handlers(target_client):
     """Attach all command handlers to a Telegram client."""
     for handler, pattern in HANDLER_SPECS:
-        target_client.add_event_handler(handler, events.NewMessage(pattern=pattern))
-    target_client.add_event_handler(calculator_message_handler, events.NewMessage)
-    target_client.add_event_handler(prefix_command_handler, events.NewMessage)
+        target_client.add_event_handler(handler, events.NewMessage(pattern=pattern, outgoing=True))
+    target_client.add_event_handler(calculator_message_handler, events.NewMessage(outgoing=True))
+    target_client.add_event_handler(prefix_command_handler, events.NewMessage(outgoing=True))
 
 
 async def start_super_admin_clients():
