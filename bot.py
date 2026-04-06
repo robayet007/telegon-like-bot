@@ -56,6 +56,9 @@ USER_USAGE = {}
 # Recent successful like activity for dashboard
 REQUEST_ACTIVITY = []
 
+# Cached user profile labels: user_id -> {username, name}
+USER_PROFILES = {}
+
 # Hierarchy ownership: child_user_id -> manager_user_id
 USER_MANAGERS = {}
 
@@ -97,7 +100,7 @@ def init_mongodb():
 def load_state():
     """Load persistent bot state from MongoDB."""
     global USER_LIMITS, USER_USAGE, USER_MANAGERS, ADMIN_USERS, SUPER_ADMIN_USERS
-    global PENDING_SUPER_ADMINS, SUPER_ADMIN_CREDENTIALS, REQUEST_ACTIVITY
+    global PENDING_SUPER_ADMINS, SUPER_ADMIN_CREDENTIALS, REQUEST_ACTIVITY, USER_PROFILES
 
     if state_collection is None:
         return
@@ -116,6 +119,10 @@ def load_state():
             for item in data.get('user_usage', [])
         }
         REQUEST_ACTIVITY = list(data.get('request_activity', []))
+        USER_PROFILES = {
+            int(user_id): profile
+            for user_id, profile in data.get('user_profiles', {}).items()
+        }
         USER_MANAGERS = {
             int(user_id): int(manager_id)
             for user_id, manager_id in data.get('user_managers', {}).items()
@@ -166,6 +173,10 @@ def save_state():
                 for (user_id, month, like_type), count in USER_USAGE.items()
             ],
             'request_activity': REQUEST_ACTIVITY[-200:],
+            'user_profiles': {
+                str(user_id): profile
+                for user_id, profile in USER_PROFILES.items()
+            },
             'admin_users': sorted(ADMIN_USERS),
             'super_admin_users': sorted(SUPER_ADMIN_USERS),
             'pending_super_admins': {
@@ -285,6 +296,54 @@ def get_remaining_distributable_limit(manager_user_id: int, like_type: int) -> i
     return max(own_limit - own_used - distributed, 0)
 
 
+def cache_user_profile(user_id: int, username: str | None = None, name: str | None = None):
+    """Persist a friendly label for a user so reports can show usernames later."""
+    profile = USER_PROFILES.get(user_id, {}).copy()
+
+    if username:
+        clean_username = username.lower().lstrip('@')
+        if clean_username:
+            profile['username'] = clean_username
+
+    if name:
+        clean_name = name.strip()
+        if clean_name:
+            profile['name'] = clean_name
+
+    if profile:
+        USER_PROFILES[user_id] = profile
+
+
+def cache_entity_profile(entity):
+    """Cache username and display name from a Telethon entity."""
+    if entity is None:
+        return
+
+    user_id = getattr(entity, 'id', None)
+    if user_id is None:
+        return
+
+    username = getattr(entity, 'username', None)
+    first = getattr(entity, 'first_name', '') or ''
+    last = getattr(entity, 'last_name', '') or ''
+    full_name = (first + ' ' + last).strip()
+    cache_user_profile(user_id, username=username, name=full_name)
+
+
+def get_cached_display_label(user_id: int) -> str | None:
+    """Return best saved label for a user."""
+    profile = USER_PROFILES.get(user_id, {})
+    username = profile.get('username')
+    if username:
+        return f"@{username}"
+
+    name = profile.get('name')
+    if name:
+        return name
+
+    return None
+
+
 async def get_sender_identity(event):
     """Resolve sender id and username reliably."""
     sender_id = event.sender_id
@@ -293,6 +352,7 @@ async def get_sender_identity(event):
     try:
         sender = await event.get_sender()
         if sender is not None:
+            cache_entity_profile(sender)
             sender_id = getattr(sender, 'id', sender_id)
             sender_username = getattr(sender, 'username', None)
     except Exception:
@@ -728,7 +788,7 @@ def format_response(data):
     return message
 
 
-RESPONSE_FOOTER = "\n━━━━━━━━━━━━━━━━━━━━\n🤖 Powered by @Mohammadrobayet"
+RESPONSE_FOOTER = "\n━━━━━━━━━━━━━━━━━━━━\n🤖 Powered by Telegon"
 
 
 def get_likes_added(data) -> int:
@@ -1003,6 +1063,8 @@ async def setadmin_command_handler(event):
 
     try:
         entity = await active_client.get_entity(username)
+        cache_entity_profile(entity)
+        save_state()
         target_user_id = entity.id
     except Exception as e:
         await event.reply(f"❌ Could not find user `{username}`\nError: `{e}`")
@@ -1034,6 +1096,8 @@ async def removeadmin_command_handler(event):
 
     try:
         entity = await active_client.get_entity(username)
+        cache_entity_profile(entity)
+        save_state()
         target_user_id = entity.id
     except Exception as e:
         await event.reply(f"❌ Could not find user `{username}`\nError: `{e}`")
@@ -1065,6 +1129,8 @@ async def setsuperadmin_command_handler(event):
 
     try:
         entity = await active_client.get_entity(username)
+        cache_entity_profile(entity)
+        save_state()
         target_user_id = entity.id
     except Exception as e:
         await event.reply(f"❌ Could not find user `{username}`\nError: `{e}`")
@@ -1136,6 +1202,8 @@ async def setlimit_command_handler(event):
         active_client = get_event_client(event)
         try:
             entity = await active_client.get_entity(username)
+            cache_entity_profile(entity)
+            save_state()
             target_user_id = entity.id
         except Exception as e:
             await event.reply(f"❌ Could not find user `{username}`\nError: `{e}`")
@@ -1171,6 +1239,8 @@ async def setsplimit_command_handler(event):
 
     try:
         entity = await active_client.get_entity(username)
+        cache_entity_profile(entity)
+        save_state()
         target_user_id = entity.id
     except Exception as e:
         await event.reply(f"❌ Could not find user `{username}`\nError: `{e}`")
@@ -1214,6 +1284,8 @@ async def resetlimit_command_handler(event):
         active_client = get_event_client(event)
         try:
             entity = await active_client.get_entity(username)
+            cache_entity_profile(entity)
+            save_state()
             target_user_id = entity.id
         except Exception as e:
             await event.reply(f"❌ Could not find user `{username}`\nError: `{e}`")
@@ -1321,8 +1393,14 @@ async def alllimit_command_handler(event):
     name_cache = {}
     active_client = get_event_client(event)
     for uid in user_ids:
+        cached_display = get_cached_display_label(uid)
+        if cached_display:
+            name_cache[uid] = cached_display
+            continue
+
         try:
             entity = await active_client.get_entity(uid)
+            cache_entity_profile(entity)
             if getattr(entity, 'username', None):
                 display = f"@{entity.username}"
             else:
@@ -1335,6 +1413,8 @@ async def alllimit_command_handler(event):
         except Exception:
             # Fallback to raw ID if we can't resolve
             name_cache[uid] = str(uid)
+
+    save_state()
 
     for uid in sorted(user_ids):
         display_name = name_cache.get(uid, str(uid))
@@ -1423,6 +1503,15 @@ async def start_super_admin_clients():
 
 async def resolve_user_label(user_id: int) -> dict:
     """Resolve a safe dashboard label for a user id."""
+    cached_display = get_cached_display_label(user_id)
+    cached_profile = USER_PROFILES.get(user_id, {})
+    if cached_display:
+        return {
+            'id': user_id,
+            'username': f"@{cached_profile['username']}" if cached_profile.get('username') else '',
+            'name': cached_display,
+        }
+
     creds = SUPER_ADMIN_CREDENTIALS.get(user_id, {})
     verified_username = creds.get('verified_account_username')
     if verified_username:
