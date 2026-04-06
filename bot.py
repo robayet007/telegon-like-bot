@@ -35,11 +35,16 @@ else:
 # admin যখন limit সেট করবে তখন থেকেই সেই user use করতে পারবে।
 DEFAULT_MONTHLY_LIMIT = 0
 
-# Per-user custom limits: user_id -> limit
+# Supported like packages / APIs
+LIKE_TYPES = (100, 200)
+# Per-user custom limits: user_id -> {100: limit, 200: limit}
 USER_LIMITS = {}
 
-# Monthly usage: (user_id, month_str) -> count
+# Monthly usage: (user_id, month_str, like_type) -> count
 USER_USAGE = {}
+
+# Extra admins promoted by the owner: user_id set
+ADMIN_USERS = set()
 
 
 def _this_month_str():
@@ -47,21 +52,47 @@ def _this_month_str():
     return datetime.utcnow().strftime('%Y-%m')
 
 
-def _usage_key(user_id: int) -> tuple:
-    """Build usage dict key for a user for this month."""
-    return (user_id, _this_month_str())
+def _usage_key(user_id: int, like_type: int) -> tuple:
+    """Build usage dict key for a user, current month, and like type."""
+    return (user_id, _this_month_str(), like_type)
 
 
-async def check_limit(event) -> bool:
+def get_user_limit(user_id: int, like_type: int) -> int:
+    """Get a user's configured limit for a specific like type."""
+    limits = USER_LIMITS.get(user_id, {})
+    return limits.get(like_type, DEFAULT_MONTHLY_LIMIT)
+
+
+async def is_owner(event) -> bool:
+    """Return True if the sender is the account owner running the bot."""
+    me = await client.get_me()
+    return event.sender_id == me.id
+
+
+async def is_admin(event) -> bool:
+    """Return True for owner or delegated admins."""
+    return await is_owner(event) or event.sender_id in ADMIN_USERS
+
+
+async def set_admin_for_user(event, target_user_id: int):
+    """Promote a user to admin."""
+    ADMIN_USERS.add(target_user_id)
+    await event.reply(
+        f"✅ Admin access granted to user `{target_user_id}`\n"
+        "They can now use: `setlimit`, `resetlimit`, `alllimit`, and `mylimit`."
+    )
+
+
+async def check_limit(event, like_type: int) -> bool:
     """
     Check if user still has quota this month.
     NOTE: This does NOT increment usage. Increment only on success.
     """
     user_id = event.sender_id
-    key = _usage_key(user_id)
+    key = _usage_key(user_id, like_type)
 
     # Get user's custom limit or default
-    limit = USER_LIMITS.get(user_id, DEFAULT_MONTHLY_LIMIT)
+    limit = get_user_limit(user_id, like_type)
     count = USER_USAGE.get(key, 0)
 
     if count >= limit:
@@ -69,34 +100,38 @@ async def check_limit(event) -> bool:
             f"⚠️ এই মাসের limit শেষ হয়ে গেছে!\n\n"
             f"👤 User ID: `{user_id}`\n"
             f"📅 Month: `{_this_month_str()}`\n"
+            f"🎯 Like Type: `{like_type}`\n"
             f"📌 Monthly limit: `{limit}` request"
         )
         return False
     return True
 
 
-def increment_usage_for_user(user_id: int):
-    """Increment this month's usage counter for a specific user."""
-    key = _usage_key(user_id)
+def increment_usage_for_user(user_id: int, like_type: int):
+    """Increment this month's usage counter for a specific user and like type."""
+    key = _usage_key(user_id, like_type)
     USER_USAGE[key] = USER_USAGE.get(key, 0) + 1
 
 
 async def reset_monthly_usage_for_user(event, target_user_id: int):
-    """Reset this month's usage counter for a specific user."""
-    key = _usage_key(target_user_id)
-    if key in USER_USAGE:
-        del USER_USAGE[key]
+    """Reset this month's usage counter for a specific user for all like types."""
+    for like_type in LIKE_TYPES:
+        key = _usage_key(target_user_id, like_type)
+        if key in USER_USAGE:
+            del USER_USAGE[key]
     await event.reply(
         f"✅ This month's usage reset for user `{target_user_id}` "
         f"for month `{_this_month_str()}`"
     )
 
 
-async def set_limit_for_user(event, target_user_id: int, limit: int):
-    """Set custom monthly limit for a specific user."""
-    USER_LIMITS[target_user_id] = limit
+async def set_limit_for_user(event, target_user_id: int, limit: int, like_type: int):
+    """Set custom monthly limit for a specific user and like type."""
+    user_limits = USER_LIMITS.setdefault(target_user_id, {})
+    user_limits[like_type] = limit
     await event.reply(
-        f"✅ Monthly limit set to `{limit}` for user `{target_user_id}`"
+        f"✅ Monthly limit set to `{limit}` for user `{target_user_id}`\n"
+        f"🎯 Like type: `{like_type}`"
     )
 
 
@@ -142,9 +177,12 @@ def get_likes_added(data) -> int:
     return added
 
 
-async def call_ff_api(uid):
-    """Make GET request to FF API"""
-    url = f"https://ff.api.emonaxc.com/like?key={API_KEY}&uid={uid}"
+async def call_ff_api(uid, like_type: int):
+    """Make GET request to the selected FF like API."""
+    if like_type == 200:
+        url = f"https://free-fire-like-api-bd12.vercel.app/like?uid={uid}&server_name=BD"
+    else:
+        url = f"https://ff.api.emonaxc.com/like?key={API_KEY}&uid={uid}"
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -169,30 +207,40 @@ async def call_ff_api(uid):
         }
 
 
-@client.on(events.NewMessage(pattern=r'(?i)^/?like\s+(\d+)$'))
+@client.on(events.NewMessage(pattern=r'(?i)^/?like\s+(\d+)\s+(100|200)$'))
 async def like_command_handler(event):
-    """Handle like <uid> command - works in both groups and private, with or without /"""
-    # Check monthly limit for this user (increment only on success)
-    if not await check_limit(event):
-        return
-
-    # Extract UID from command
-    match = re.search(r'(\d+)', event.raw_text)
+    """Handle like <uid> <100|200> command."""
+    match = re.match(r'(?i)^/?like\s+(\d+)\s+(100|200)$', event.raw_text.strip())
     if not match:
-        await event.reply("❌ Invalid format. Use: `/like <uid>`")
+        await event.reply("❌ Invalid format. Use: `/like <uid> 100` or `/like <uid> 200`")
         return
 
     uid = match.group(1)
+    like_type = int(match.group(2))
+
+    if get_user_limit(event.sender_id, like_type) <= 0:
+        await event.reply(
+            f"❌ আপনার `{like_type}` like package limit set করা নেই.\n\n"
+            "Admin example:\n"
+            f"`setlimit 5 @username {like_type}`"
+        )
+        return
+
+    # Check monthly limit for this user (increment only on success)
+    if not await check_limit(event, like_type):
+        return
 
     # Send processing message
     try:
-        processing_msg = await event.reply(f"⏳ Processing like request for UID: {uid}...")
+        processing_msg = await event.reply(
+            f"⏳ Processing `{like_type}` like request for UID: {uid}..."
+        )
     except Exception as e:
         print(f"Error replying: {e}")
         return
 
     # Call API
-    result = await call_ff_api(uid)
+    result = await call_ff_api(uid, like_type)
 
     # Handle response
     if result.get('error'):
@@ -207,11 +255,11 @@ async def like_command_handler(event):
         # Threshold: যদি ৫০ বা তার বেশি like add হয়, তবেই limit কাটবে
         THRESHOLD = 50
 
-        formatted_message = format_response(result)
+        formatted_message = format_response(result) + f"\n🎯 Like Type Used: {like_type}"
 
         if likes_added >= THRESHOLD:
             # SUCCESS -> count this request
-            increment_usage_for_user(event.sender_id)
+            increment_usage_for_user(event.sender_id, like_type)
         else:
             # Not enough likes added -> don't count towards limit, just a short note
             formatted_message += "\n\n✅ **Limit refunded**"
@@ -233,10 +281,10 @@ async def start_command_handler(event):
 Send likes to Free Fire players using their UID.
 
 **Usage:**
-`/like <uid>`
+`/like <uid> <100|200>`
 
 **Example:**
-`/like 1711537287`
+`/like 1711537287 100`
 
 **Note:** This bot uses your Telegram account to send commands."""
     else:
@@ -245,10 +293,10 @@ Send likes to Free Fire players using their UID.
 Send likes to Free Fire players using their UID.
 
 **Usage:**
-`/like <uid>` or `like <uid>`
+`/like <uid> <100|200>` or `like <uid> <100|200>`
 
 **Example:**
-`/like 1711537287`
+`/like 1711537287 200`
 
 **Note:** This bot uses your Telegram account to send commands."""
 
@@ -260,45 +308,47 @@ async def help_command_handler(event):
     """Handle help command - works in both groups and private (with or without /)"""
     is_group = not event.is_private
     
-    # Check if user is owner/admin
-    me = await client.get_me()
-    is_owner = event.sender_id == me.id
+    can_manage = await is_admin(event)
 
     # ---------- User Commands ----------
     if is_group:
         user_cmds = """👥 **User Commands (Group & Private)**
 
-- `like <uid>` – Free Fire UID-এ like পাঠাবে
+- `like <uid> <100|200>` – Free Fire UID-এ selected package-এর like পাঠাবে
 - `start` – Bot সম্পর্কে basic তথ্য দেখাবে
 - `help` – এই help message দেখাবে
-- `mylimit` – এই মাসে কতবার use করেছেন ও আপনার monthly limit কত তা দেখাবে
+- `mylimit` – এই মাসে 100/200 package usage দেখাবে
 
 **Example:**
-`like 1711537287`"""
+`like 1711537287 100`"""
     else:
         user_cmds = """👤 **User Commands (Private & Group)**
 
-- `like <uid>` / `/like <uid>` – Free Fire UID-এ like পাঠাবে
+- `like <uid> <100|200>` / `/like <uid> <100|200>` – Free Fire UID-এ selected package-এর like পাঠাবে
 - `start` / `/start` – Bot সম্পর্কে basic তথ্য
 - `help` / `/help` – এই help message
-- `mylimit` / `/mylimit` – এই মাসের ব্যবহার ও monthly limit দেখাবে
+- `mylimit` / `/mylimit` – এই মাসের 100/200 package usage দেখাবে
 
 **Example:**
-`like 1711537287`"""
+`like 1711537287 200`"""
 
     # ---------- Admin / Owner Commands ----------
     # Note: এগুলো শুধু bot owner (যে account দিয়ে bot চালাচ্ছেন) use করতে পারবে
     admin_cmds = """
     
-🛠 **Admin / Owner Commands**
+🛠 **Admin Commands**
 
-- `setlimit <n>` / `/setlimit <n>`  
-  ➤ নিজের monthly limit `n` সেট করবে  
-  উদাহরণ: `setlimit 10`
+- `setadmin @username`
+  ➤ নতুন admin বানাবে
+  উদাহরণ: `setadmin @testuser`
 
-- `setlimit <n> @username`  
-  ➤ নির্দিষ্ট user-এর monthly limit সেট করবে  
-  উদাহরণ: `setlimit 5 @testuser`
+- `setlimit <n> <100|200>`  
+  ➤ নিজের monthly limit `n` set করবে selected like package-এর জন্য  
+  উদাহরণ: `setlimit 10 100`
+
+- `setlimit <n> @username <100|200>`  
+  ➤ নির্দিষ্ট user-এর জন্য `100` বা `200` like package set করবে  
+  উদাহরণ: `setlimit 5 @testuser 200`
 
 - `resetlimit` / `/resetlimit`  
   ➤ নিজের এই মাসের usage reset করবে
@@ -307,11 +357,11 @@ async def help_command_handler(event):
   ➤ ঐ user-এর এই মাসের usage reset করবে
 
 - `alllimit` / `/alllimit`  
-  ➤ এই মাসের জন্য সব user-এর used / limit / remaining list দেখাবে (owner only)
+  ➤ এই মাসের জন্য সব user-এর 100/200 used / limit / remaining list দেখাবে
 """
 
-    # Owner হলে full help, regular user হলে শুধু user commands
-    if is_owner:
+    # Owner/admin হলে full help, regular user হলে শুধু user commands
+    if can_manage:
         help_message = f"""📖 **Help**
 
 {user_cmds}{admin_cmds}
@@ -320,6 +370,7 @@ async def help_command_handler(event):
 - Commands case-insensitive: `like`, `Like`, `LIKE` সব কাজ করবে
 - Slash (`/`) সহ বা ছাড়া – দু’ভাবেই command দেওয়া যাবে
 - Valid UID numeric হতে হবে
+- `setadmin` শুধু owner use করতে পারবে
 """
     else:
         help_message = f"""📖 **Help**
@@ -339,28 +390,60 @@ async def help_command_handler(event):
 # =========================
 
 
-@client.on(events.NewMessage(pattern=r'(?i)^/?setlimit\s+(\d+)(?:\s+(@?\w+))?$'))
+@client.on(events.NewMessage(pattern=r'(?i)^/?setadmin\s+(@?\w+)$'))
+async def setadmin_command_handler(event):
+    """
+    Promote a user to admin.
+    Usage:
+      /setadmin @username
+    """
+    if not await is_owner(event):
+        await event.reply("❌ Only the bot owner can use /setadmin.")
+        return
+
+    text = event.raw_text.strip()
+    match = re.match(r'(?i)^/?setadmin\s+(@?\w+)$', text)
+    if not match:
+        await event.reply("❌ Invalid format.\nUsage: `/setadmin @username`")
+        return
+
+    username = match.group(1)
+
+    try:
+        entity = await client.get_entity(username)
+        target_user_id = entity.id
+    except Exception as e:
+        await event.reply(f"❌ Could not find user `{username}`\nError: `{e}`")
+        return
+
+    await set_admin_for_user(event, target_user_id)
+
+
+@client.on(events.NewMessage(pattern=r'(?i)^/?setlimit\s+(\d+)(?:\s+(@?\w+))?\s+(100|200)$'))
 async def setlimit_command_handler(event):
     """
     Set monthly limit for a user.
     Usage:
-      /setlimit 5           -> set your own monthly limit to 5
-      /setlimit 5 @username -> set monthly limit for @username
+      /setlimit 5 100           -> set your own 100-like monthly limit
+      /setlimit 5 @username 200 -> set 200-like monthly limit for @username
     """
-    # Only allow owner (self account) to change limits
-    me = await client.get_me()
-    if event.sender_id != me.id:
-        await event.reply("❌ Only the bot owner can use /setlimit.")
+    # Allow owner and delegated admins
+    if not await is_admin(event):
+        await event.reply("❌ Only admins can use /setlimit.")
         return
 
     text = event.raw_text.strip()
-    match = re.match(r'(?i)^/?setlimit\s+(\d+)(?:\s+(@?\w+))?$', text)
+    match = re.match(r'(?i)^/?setlimit\s+(\d+)(?:\s+(@?\w+))?\s+(100|200)$', text)
     if not match:
-        await event.reply("❌ Invalid format.\nUsage: `/setlimit 5` or `/setlimit 5 @username`")
+        await event.reply(
+            "❌ Invalid format.\n"
+            "Usage: `/setlimit 5 100` or `/setlimit 5 @username 200`"
+        )
         return
 
     limit = int(match.group(1))
     username = match.group(2)
+    like_type = int(match.group(3))
 
     # Determine target user
     if username:
@@ -373,7 +456,7 @@ async def setlimit_command_handler(event):
     else:
         target_user_id = event.sender_id
 
-    await set_limit_for_user(event, target_user_id, limit)
+    await set_limit_for_user(event, target_user_id, limit, like_type)
 
 
 @client.on(events.NewMessage(pattern=r'(?i)^/?resetlimit(?:\s+(@?\w+))?$'))
@@ -384,10 +467,9 @@ async def resetlimit_command_handler(event):
       /resetlimit           -> reset your own usage for this month
       /resetlimit @username -> reset usage for @username this month
     """
-    # Only allow owner to reset limits
-    me = await client.get_me()
-    if event.sender_id != me.id:
-        await event.reply("❌ Only the bot owner can use /resetlimit.")
+    # Allow owner and delegated admins
+    if not await is_admin(event):
+        await event.reply("❌ Only admins can use /resetlimit.")
         return
 
     text = event.raw_text.strip()
@@ -419,18 +501,26 @@ async def mylimit_command_handler(event):
     Usage: /mylimit
     """
     user_id = event.sender_id
-    key = _usage_key(user_id)
-    limit = USER_LIMITS.get(user_id, DEFAULT_MONTHLY_LIMIT)
-    used = USER_USAGE.get(key, 0)
+    lines = [
+        "📊 **Your Limit Status**\n",
+        f"👤 User ID: `{user_id}`",
+        f"📅 Month: `{_this_month_str()}`",
+        ""
+    ]
 
-    await event.reply(
-        f"📊 **Your Limit Status**\n\n"
-        f"👤 User ID: `{user_id}`\n"
-        f"📅 Month: `{_this_month_str()}`\n"
-        f"✅ Used: `{used}` request(s)\n"
-        f"📌 Monthly Limit: `{limit}` request(s)\n"
-        f"🔄 Remaining: `{max(limit - used, 0)}` request(s)"
-    )
+    for like_type in LIKE_TYPES:
+        key = _usage_key(user_id, like_type)
+        limit = get_user_limit(user_id, like_type)
+        used = USER_USAGE.get(key, 0)
+        remaining = max(limit - used, 0)
+        lines.append(
+            f"🔥 `{like_type}` Like Package\n"
+            f"✅ Used: `{used}` request(s)\n"
+            f"📌 Monthly Limit: `{limit}` request(s)\n"
+            f"🔄 Remaining: `{remaining}` request(s)\n"
+        )
+
+    await event.reply("\n".join(lines))
 
 
 @client.on(events.NewMessage(pattern=r'(?i)^/?alllimit$'))
@@ -439,10 +529,9 @@ async def alllimit_command_handler(event):
     Show this month's usage & limits for all users (owner only).
     Usage: alllimit / /alllimit
     """
-    # Only owner can see full list
-    me = await client.get_me()
-    if event.sender_id != me.id:
-        await event.reply("❌ Only the bot owner can use `alllimit`.")
+    # Allow owner and delegated admins
+    if not await is_admin(event):
+        await event.reply("❌ Only admins can use `alllimit`.")
         return
 
     this_month = _this_month_str()
@@ -478,17 +567,21 @@ async def alllimit_command_handler(event):
             name_cache[uid] = str(uid)
 
     for uid in sorted(user_ids):
-        key = (uid, this_month)
-        limit = USER_LIMITS.get(uid, DEFAULT_MONTHLY_LIMIT)
-        used = USER_USAGE.get(key, 0)
-        remaining = max(limit - used, 0)
         display_name = name_cache.get(uid, str(uid))
+        user_block = [
+            f"👤 User: **{display_name}** (`{uid}`)"
+        ]
 
-        lines.append(
-            f"👤 User: **{display_name}** (`{uid}`)\n"
-            f"   ✅ Used: `{used}` / `{limit}`\n"
-            f"   🔄 Remaining: `{remaining}`\n"
-        )
+        for like_type in LIKE_TYPES:
+            key = (uid, this_month, like_type)
+            limit = get_user_limit(uid, like_type)
+            used = USER_USAGE.get(key, 0)
+            remaining = max(limit - used, 0)
+            user_block.append(
+                f"🔥 `{like_type}` Like: used `{used}` / `{limit}` | remaining `{remaining}`"
+            )
+
+        lines.append("\n".join(user_block) + "\n")
 
     msg = "\n".join(lines)
     await event.reply(msg)
