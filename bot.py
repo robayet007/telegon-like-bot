@@ -1117,6 +1117,24 @@ def is_known_super_admin_identity(sender_id: int, sender_username: str | None) -
     return False
 
 
+def resolve_branch_actor_user_id(sender_id: int | None, sender_username: str | None) -> int | None:
+    """Map a verified super-admin identity back to its stored branch owner id."""
+    if sender_id is not None and sender_id in SUPER_ADMIN_CREDENTIALS:
+        return int(sender_id)
+
+    for stored_user_id, creds in SUPER_ADMIN_CREDENTIALS.items():
+        verified_account_id = creds.get('verified_account_id')
+        verified_username = creds.get('verified_account_username')
+
+        if sender_id is not None and verified_account_id == sender_id:
+            return int(stored_user_id)
+
+        if sender_username and verified_username and verified_username.lower() == sender_username:
+            return int(stored_user_id)
+
+    return sender_id
+
+
 async def is_owner(event) -> bool:
     """Return True if the sender is the account owner running the bot."""
     me = await MAIN_CLIENT.get_me()
@@ -2735,6 +2753,7 @@ async def myaccess_command_handler(event):
     """Show the sender's current access level."""
     await log_access_check(event, "myaccess")
     sender_id, sender_username = await get_sender_identity(event)
+    branch_actor_user_id = resolve_branch_actor_user_id(sender_id, sender_username)
     owner = await is_owner(event)
     super_admin = await is_super_admin(event)
     admin = await is_admin(event)
@@ -2753,8 +2772,9 @@ async def myaccess_command_handler(event):
         f"👤 User ID: `{sender_id}`\n"
         f"🏷 Username: `{('@' + sender_username) if sender_username else 'N/A'}`\n"
         f"🛡 Role: `{role}`\n"
-        f"👤 Manager ID: `{get_manager_id(sender_id) or 'N/A'}`\n"
-        f"🔑 Prefix: `{get_manager_prefix(sender_id) or 'Not set'}`"
+        f"👤 Branch ID: `{branch_actor_user_id or 'N/A'}`\n"
+        f"👤 Manager ID: `{get_manager_id(branch_actor_user_id) or 'N/A'}`\n"
+        f"🔑 Prefix: `{get_manager_prefix(branch_actor_user_id) or 'Not set'}`"
     )
 
 
@@ -2870,6 +2890,9 @@ async def prefix_command_handler(event):
     if not text:
         return
 
+    sender_id, sender_username = await get_sender_identity(event)
+    branch_actor_user_id = resolve_branch_actor_user_id(sender_id, sender_username)
+
     setprefix_match = re.match(r'(?i)^/?setprefix\s+(\S)$', text)
     if setprefix_match:
         await log_access_check(event, "setprefix")
@@ -2878,17 +2901,18 @@ async def prefix_command_handler(event):
             return
 
         prefix = setprefix_match.group(1)
-        actor_user_id, _ = await get_sender_identity(event)
         async with STATE_LOCK:
-            set_manager_prefix(actor_user_id, prefix)
+            set_manager_prefix(branch_actor_user_id, prefix)
             save_state()
-        await event.reply(f"✅ 𝗣𝗿𝗲𝗳𝗶𝘅 `{prefix}` 𝗮𝗹𝗶𝘃𝗲")
+        await event.reply(
+            f"✅ 𝗣𝗿𝗲𝗳𝗶𝘅 `{prefix}` 𝗮𝗹𝗶𝘃𝗲\n"
+            f"👤 Branch ID: `{branch_actor_user_id}`"
+        )
         return
 
     if not event.is_private:
         return
 
-    sender_id, _ = await get_sender_identity(event)
     command_match = re.match(r'(?is)^([A-Za-z])(\w+)(?:\s+([\s\S]+))?$', text)
     if not command_match:
         return
@@ -2924,7 +2948,7 @@ async def prefix_command_handler(event):
         await event.reply("❌ Could not detect the target user in this private chat.")
         return
 
-    prefix_owner_id = resolve_prefix_owner_for_private_chat(int(sender_id), int(target_user_id), prefix)
+    prefix_owner_id = resolve_prefix_owner_for_private_chat(int(branch_actor_user_id), int(target_user_id), prefix)
     if prefix_owner_id is None:
         return
 
@@ -2933,7 +2957,7 @@ async def prefix_command_handler(event):
         save_state()
 
     if action == "signup":
-        if prefix_owner_id != sender_id:
+        if prefix_owner_id != branch_actor_user_id:
             return
 
         await log_access_check(event, "prefixsignup")
@@ -2944,7 +2968,7 @@ async def prefix_command_handler(event):
         return
 
     if action == "signout":
-        if prefix_owner_id != sender_id:
+        if prefix_owner_id != branch_actor_user_id:
             return
 
         await log_access_check(event, "prefixsignout")
@@ -2958,7 +2982,7 @@ async def prefix_command_handler(event):
         return
 
     if action == "duelimit":
-        if prefix_owner_id != sender_id:
+        if prefix_owner_id != branch_actor_user_id:
             return
 
         await log_access_check(event, "prefixduelimit")
@@ -2989,14 +3013,14 @@ async def prefix_command_handler(event):
     if action == "balance":
         branch_user_id = resolve_prefixed_branch_account_user(
             prefix_owner_id,
-            int(sender_id),
+            int(branch_actor_user_id),
             int(target_user_id),
         )
         if not is_registered_under_branch(prefix_owner_id, branch_user_id):
             await event.reply("❌ This user is not registered under your branch.")
             return
         if argument_text:
-            if prefix_owner_id != sender_id:
+            if prefix_owner_id != branch_actor_user_id:
                 return
 
             await log_access_check(event, "prefixsetbalance")
@@ -3020,14 +3044,14 @@ async def prefix_command_handler(event):
         return
 
     if action == "stock":
-        if not is_registered_under_branch(prefix_owner_id, int(sender_id)):
+        if not is_registered_under_branch(prefix_owner_id, int(branch_actor_user_id)):
             await event.reply("❌ You are not registered under this branch.")
             return
         await send_stock_card(event, prefix_owner_id)
         return
 
     if action == "stockadd":
-        if prefix_owner_id != sender_id:
+        if prefix_owner_id != branch_actor_user_id:
             return
 
         await log_access_check(event, "prefixstockadd")
@@ -3043,14 +3067,14 @@ async def prefix_command_handler(event):
         return
 
     if action == "help":
-        if not is_registered_under_branch(prefix_owner_id, int(sender_id)):
+        if not is_registered_under_branch(prefix_owner_id, int(branch_actor_user_id)):
             await event.reply("❌ You are not registered under this branch.")
             return
-        await send_prefix_help_card(event, prefix, prefix_owner_id, int(sender_id))
+        await send_prefix_help_card(event, prefix, prefix_owner_id, int(branch_actor_user_id))
         return
 
     if action == "rate":
-        if not is_registered_under_branch(prefix_owner_id, int(sender_id)):
+        if not is_registered_under_branch(prefix_owner_id, int(branch_actor_user_id)):
             await event.reply("❌ You are not registered under this branch.")
             return
         await send_rate_card(event, prefix_owner_id)
@@ -3059,7 +3083,7 @@ async def prefix_command_handler(event):
     if action == "due":
         branch_user_id = resolve_prefixed_branch_account_user(
             prefix_owner_id,
-            int(sender_id),
+            int(branch_actor_user_id),
             int(target_user_id),
         )
         if not is_registered_under_branch(prefix_owner_id, branch_user_id):
@@ -3087,7 +3111,7 @@ async def prefix_command_handler(event):
         return
 
     if action == "clear":
-        if prefix_owner_id != sender_id:
+        if prefix_owner_id != branch_actor_user_id:
             return
 
         await log_access_check(event, "prefixclear")
@@ -3105,7 +3129,7 @@ async def prefix_command_handler(event):
     if action == "tp":
         branch_user_id = resolve_prefixed_branch_account_user(
             prefix_owner_id,
-            int(sender_id),
+            int(branch_actor_user_id),
             int(target_user_id),
         )
         if not is_registered_under_branch(prefix_owner_id, branch_user_id):
@@ -3139,7 +3163,7 @@ async def prefix_command_handler(event):
         return
 
     if action in set(UC_STOCK_CATEGORY_ORDER):
-        if prefix_owner_id != sender_id:
+        if prefix_owner_id != branch_actor_user_id:
             return
 
         await log_access_check(event, "prefixsetrate")
