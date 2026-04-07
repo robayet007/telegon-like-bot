@@ -1445,9 +1445,9 @@ async def register_user_under_manager(event, target_user_id: int):
     """Attach a regular user to the sender's branch."""
     actor_user_id, _ = await get_sender_identity(event)
 
-    # if target_user_id == actor_user_id:
-    #     await event.reply("❌ You cannot register yourself with signup.")
-    #     return
+    if target_user_id == actor_user_id:
+        await event.reply("❌ You cannot register yourself with signup.")
+        return
 
     existing_manager_id = get_manager_id(target_user_id)
     if existing_manager_id == actor_user_id:
@@ -1486,9 +1486,9 @@ async def signout_user_from_manager(event, target_user_id: int):
     """Remove any managed account from the sender's branch."""
     actor_user_id, _ = await get_sender_identity(event)
 
-    # if target_user_id == actor_user_id:
-    #     await event.reply("❌ You cannot sign out yourself.")
-    #     return
+    if target_user_id == actor_user_id:
+        await event.reply("❌ You cannot sign out yourself.")
+        return
 
     existing_manager_id = get_manager_id(target_user_id)
     if existing_manager_id is None:
