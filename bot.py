@@ -2790,6 +2790,23 @@ async def prefix_command_handler(event):
     prefix = command_match.group(1)
     action = command_match.group(2).lower()
     argument_text = (command_match.group(3) or '').strip()
+    supported_prefixed_actions = {
+        "signup",
+        "signout",
+        "duelimit",
+        "balance",
+        "stock",
+        "stockadd",
+        "help",
+        "rate",
+        "due",
+        "clear",
+        "tp",
+    }
+    supported_prefixed_actions.update(UC_STOCK_CATEGORY_ORDER)
+    if action not in supported_prefixed_actions:
+        return
+
     try:
         private_chat = await event.get_chat()
     except Exception as e:
@@ -2803,10 +2820,6 @@ async def prefix_command_handler(event):
 
     prefix_owner_id = resolve_prefix_owner_for_private_chat(int(sender_id), int(target_user_id), prefix)
     if prefix_owner_id is None:
-        await event.reply(
-            f"❌ Prefix `{prefix}` is not active for this account.\n"
-            "Ask your manager to set the prefix again and register this user under that branch."
-        )
         return
 
     async with STATE_LOCK:
