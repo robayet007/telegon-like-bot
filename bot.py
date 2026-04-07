@@ -650,6 +650,12 @@ def resolve_prefix_owner_for_private_chat(sender_id: int, private_chat_user_id: 
     return None
 
 
+def user_owns_exact_prefix(user_id: int, prefix_text: str) -> bool:
+    """Return True when the given user explicitly owns the provided prefix."""
+    prefix = get_manager_prefix(user_id)
+    return bool(prefix and prefix.lower() == prefix_text.lower())
+
+
 def is_registered_under_branch(prefix_owner_id: int, target_user_id: int) -> bool:
     """Return True when a target belongs to the prefix owner's branch."""
     if target_user_id == prefix_owner_id:
@@ -1193,16 +1199,33 @@ async def get_access_role(event) -> str:
 
 
 async def should_ignore_privileged_incoming_private_command(event) -> bool:
-    """Avoid double-processing commands mirrored between privileged private chats."""
-    if not getattr(event, 'incoming', False) or not event.is_private:
+    """Avoid double-processing mirrored commands across the managed clients."""
+    if not getattr(event, 'incoming', False):
         return False
 
     sender_id, sender_username = await get_sender_identity(event)
     if sender_id is None:
         return False
 
+    event_client = get_event_client(event)
     owner = await MAIN_CLIENT.get_me()
     owner_id = getattr(owner, 'id', None)
+
+    if event.is_private:
+        return (
+            sender_id == owner_id
+            or sender_id in ADMIN_USERS
+            or is_known_super_admin_identity(sender_id, sender_username)
+        )
+
+    if event.is_group or event.is_channel:
+        if event_client != MAIN_CLIENT:
+            return True
+
+        return (
+            sender_id == owner_id
+            or is_known_super_admin_identity(sender_id, sender_username)
+        )
 
     return (
         sender_id == owner_id
@@ -1578,6 +1601,7 @@ async def send_prefix_help_card(event, prefix: str, prefix_owner_id: int, sender
         "",
         "👤 Usᴇʀ Cᴏᴍᴍᴀɴᴅs",
         f"- `{prefix}help`",
+        f"- `{prefix}myaccess`",
         f"- `{prefix}balance`",
         f"- `{prefix}due`",
         f"- `{prefix}rate`",
@@ -1610,6 +1634,30 @@ async def send_prefix_help_card(event, prefix: str, prefix_owner_id: int, sender
         ])
 
     await reply_via_branch_owner(event, prefix_owner_id, "\n".join(user_lines))
+
+
+async def send_prefixed_access_card(event, prefix: str, prefix_owner_id: int, sender_id: int, sender_username: str | None):
+    """Show access details for the current user inside a resolved prefix branch."""
+    branch_actor_user_id = resolve_branch_actor_user_id(sender_id, sender_username)
+
+    if sender_id == prefix_owner_id:
+        role = "Owner" if await is_owner(event) else "Super Admin"
+    elif sender_id in ADMIN_USERS:
+        role = "Admin"
+    else:
+        role = "User"
+
+    await reply_via_branch_owner(
+        event,
+        prefix_owner_id,
+        f"🔐 **Your Access**\n\n"
+        f"👤 User ID: `{sender_id}`\n"
+        f"🏷 Username: `{('@' + sender_username) if sender_username else 'N/A'}`\n"
+        f"🛡 Role: `{role}`\n"
+        f"👤 Branch ID: `{branch_actor_user_id or 'N/A'}`\n"
+        f"👤 Prefix Owner: `{prefix_owner_id}`\n"
+        f"🔑 Prefix: `{prefix}`"
+    )
 
 
 async def set_branch_rate_command(event, owner_user_id: int, category: str, price: Decimal):
@@ -3020,6 +3068,7 @@ async def prefix_command_handler(event):
     supported_prefixed_actions = {
         "signup",
         "signout",
+        "myaccess",
         "duelimit",
         "balance",
         "stock",
@@ -3069,7 +3118,18 @@ async def prefix_command_handler(event):
     }.union(set(UC_STOCK_CATEGORY_ORDER)):
         return
 
+    if action == "myaccess":
+        if not is_registered_under_branch(prefix_owner_id, int(branch_actor_user_id)):
+            await reply_via_branch_owner(event, prefix_owner_id, "❌ You are not registered under this branch.")
+            return
+        await send_prefixed_access_card(event, prefix, prefix_owner_id, int(sender_id), sender_username)
+        return
+
     if action == "signup":
+        if not user_owns_exact_prefix(int(branch_actor_user_id), prefix):
+            await event.reply("❌ This prefix is not owned by your account.")
+            return
+
         if prefix_owner_id != branch_actor_user_id:
             return
 
@@ -3081,6 +3141,10 @@ async def prefix_command_handler(event):
         return
 
     if action == "signout":
+        if not user_owns_exact_prefix(int(branch_actor_user_id), prefix):
+            await event.reply("❌ This prefix is not owned by your account.")
+            return
+
         if prefix_owner_id != branch_actor_user_id:
             return
 
