@@ -2243,7 +2243,10 @@ async def like_command_handler(event):
             await event.reply(formatted_message)
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?start$'))
+START_PATTERN = r'(?i)^/?start$'
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=START_PATTERN))
 async def start_command_handler(event):
     """Handle start command - works in both groups and private (with or without /)"""
     is_group = not event.is_private
@@ -2276,7 +2279,10 @@ Send likes to Free Fire players using their UID.
     await event.reply(help_message)
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?help$'))
+HELP_PATTERN = r'(?i)^/?help$'
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=HELP_PATTERN))
 async def help_command_handler(event):
     """Handle help command - works in both groups and private (with or without /)"""
     is_group = not event.is_private
@@ -2717,7 +2723,10 @@ async def resetlimit_command_handler(event):
     await reset_monthly_usage_for_user(event, target_user_id)
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?mylimit$'))
+MYLIMIT_PATTERN = r'(?i)^/?mylimit$'
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=MYLIMIT_PATTERN))
 async def mylimit_command_handler(event):
     """
     Show current limit and this month's usage for the caller.
@@ -2752,7 +2761,10 @@ async def mylimit_command_handler(event):
     await event.reply("\n".join(lines))
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?myaccess$'))
+MYACCESS_PATTERN = r'(?i)^/?myaccess$'
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=MYACCESS_PATTERN))
 async def myaccess_command_handler(event):
     """Show the sender's current access level."""
     await log_access_check(event, "myaccess")
@@ -3194,7 +3206,11 @@ async def prefix_command_handler(event):
 
 client.add_event_handler(calculator_message_handler, events.NewMessage(outgoing=True))
 client.add_event_handler(prefix_command_handler, events.NewMessage())
+client.add_event_handler(start_command_handler, events.NewMessage(pattern=START_PATTERN, incoming=True))
+client.add_event_handler(help_command_handler, events.NewMessage(pattern=HELP_PATTERN, incoming=True))
 client.add_event_handler(like_command_handler, events.NewMessage(pattern=LIKE_PATTERN, incoming=True))
+client.add_event_handler(mylimit_command_handler, events.NewMessage(pattern=MYLIMIT_PATTERN, incoming=True))
+client.add_event_handler(myaccess_command_handler, events.NewMessage(pattern=MYACCESS_PATTERN, incoming=True))
 # Pending super admins send `superauth` to the main account as an incoming DM.
 client.add_event_handler(superauth_command_handler, events.NewMessage(pattern=SUPERAUTH_PATTERN, incoming=True))
 
@@ -3223,7 +3239,11 @@ def register_handlers(target_client):
         target_client.add_event_handler(handler, events.NewMessage(pattern=pattern, outgoing=True))
     target_client.add_event_handler(calculator_message_handler, events.NewMessage(outgoing=True))
     target_client.add_event_handler(prefix_command_handler, events.NewMessage())
+    target_client.add_event_handler(start_command_handler, events.NewMessage(pattern=START_PATTERN, incoming=True))
+    target_client.add_event_handler(help_command_handler, events.NewMessage(pattern=HELP_PATTERN, incoming=True))
     target_client.add_event_handler(like_command_handler, events.NewMessage(pattern=LIKE_PATTERN, incoming=True))
+    target_client.add_event_handler(mylimit_command_handler, events.NewMessage(pattern=MYLIMIT_PATTERN, incoming=True))
+    target_client.add_event_handler(myaccess_command_handler, events.NewMessage(pattern=MYACCESS_PATTERN, incoming=True))
 
 
 async def start_super_admin_clients():
