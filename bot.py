@@ -1171,6 +1171,39 @@ async def get_access_role(event) -> str:
     return "User"
 
 
+async def should_ignore_privileged_incoming_private_command(event) -> bool:
+    """Avoid double-processing commands mirrored between privileged private chats."""
+    if not getattr(event, 'incoming', False) or not event.is_private:
+        return False
+
+    sender_id, sender_username = await get_sender_identity(event)
+    if sender_id is None:
+        return False
+
+    event_client = get_event_client(event)
+    me = await event_client.get_me()
+    receiver_id = getattr(me, 'id', None)
+    receiver_username = getattr(me, 'username', None)
+
+    if receiver_id is None or receiver_id == sender_id:
+        return False
+
+    owner = await MAIN_CLIENT.get_me()
+    owner_id = getattr(owner, 'id', None)
+
+    sender_is_privileged = (
+        sender_id == owner_id
+        or sender_id in ADMIN_USERS
+        or is_known_super_admin_identity(sender_id, sender_username)
+    )
+    receiver_is_privileged = (
+        receiver_id == owner_id
+        or receiver_id in ADMIN_USERS
+        or is_known_super_admin_identity(receiver_id, receiver_username)
+    )
+    return sender_is_privileged and receiver_is_privileged
+
+
 async def can_create_super_admin(event) -> bool:
     """Only the main owner can create super admins."""
     return await is_owner(event)
@@ -2179,6 +2212,9 @@ LIKE_PATTERN = r'(?i)^/?like\s+(\d+)\s+(100|200)$'
 @client.on(events.NewMessage(outgoing=True, pattern=LIKE_PATTERN))
 async def like_command_handler(event):
     """Handle like <uid> <100|200> command."""
+    if await should_ignore_privileged_incoming_private_command(event):
+        return
+
     match = re.match(LIKE_PATTERN, event.raw_text.strip())
     if not match:
         await event.reply("❌ Invalid format. Use: `/like <uid> 100` or `/like <uid> 200`")
@@ -2249,6 +2285,9 @@ START_PATTERN = r'(?i)^/?start$'
 @client.on(events.NewMessage(outgoing=True, pattern=START_PATTERN))
 async def start_command_handler(event):
     """Handle start command - works in both groups and private (with or without /)"""
+    if await should_ignore_privileged_incoming_private_command(event):
+        return
+
     is_group = not event.is_private
 
     if is_group:
@@ -2285,6 +2324,9 @@ HELP_PATTERN = r'(?i)^/?help$'
 @client.on(events.NewMessage(outgoing=True, pattern=HELP_PATTERN))
 async def help_command_handler(event):
     """Handle help command - works in both groups and private (with or without /)"""
+    if await should_ignore_privileged_incoming_private_command(event):
+        return
+
     is_group = not event.is_private
     
     can_manage = await is_admin(event)
@@ -2573,6 +2615,9 @@ async def superauth_command_handler(event):
     Usage:
       /superauth <api_id> <api_hash> <session_string>
     """
+    if await should_ignore_privileged_incoming_private_command(event):
+        return
+
     text = event.raw_text.strip()
     match = re.match(SUPERAUTH_PATTERN, text)
     if not match:
@@ -2732,6 +2777,9 @@ async def mylimit_command_handler(event):
     Show current limit and this month's usage for the caller.
     Usage: /mylimit
     """
+    if await should_ignore_privileged_incoming_private_command(event):
+        return
+
     user_id, _ = await get_sender_identity(event)
     role = await get_access_role(event)
     lines = [
@@ -2767,6 +2815,9 @@ MYACCESS_PATTERN = r'(?i)^/?myaccess$'
 @client.on(events.NewMessage(outgoing=True, pattern=MYACCESS_PATTERN))
 async def myaccess_command_handler(event):
     """Show the sender's current access level."""
+    if await should_ignore_privileged_incoming_private_command(event):
+        return
+
     await log_access_check(event, "myaccess")
     sender_id, sender_username = await get_sender_identity(event)
     branch_actor_user_id = resolve_branch_actor_user_id(sender_id, sender_username)
@@ -2899,6 +2950,9 @@ async def calculator_message_handler(event):
 
 async def prefix_command_handler(event):
     """Handle dynamic setPrefix and branch-aware prefixed commands."""
+    if await should_ignore_privileged_incoming_private_command(event):
+        return
+
     if not getattr(event, 'raw_text', None):
         return
 
