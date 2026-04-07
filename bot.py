@@ -624,6 +624,21 @@ def resolve_prefix_owner_for_user(user_id: int, prefix_text: str) -> int | None:
     return None
 
 
+def resolve_prefix_owner_for_private_chat(sender_id: int, private_chat_user_id: int, prefix_text: str) -> int | None:
+    """Resolve a branch prefix in a private chat.
+
+    In most user chats, ``sender_id`` and ``private_chat_user_id`` are the same.
+    Some Telegram event shapes can differ though, so we try both identities to
+    avoid silently dropping valid branch commands.
+    """
+    owner_id = resolve_prefix_owner_for_user(sender_id, prefix_text)
+    if owner_id is not None:
+        return owner_id
+    if private_chat_user_id != sender_id:
+        return resolve_prefix_owner_for_user(private_chat_user_id, prefix_text)
+    return None
+
+
 def is_registered_under_branch(prefix_owner_id: int, target_user_id: int) -> bool:
     """Return True when a target belongs to the prefix owner's branch."""
     if target_user_id == prefix_owner_id:
@@ -631,15 +646,16 @@ def is_registered_under_branch(prefix_owner_id: int, target_user_id: int) -> boo
     return is_managed_by(prefix_owner_id, target_user_id)
 
 
-def resolve_prefixed_branch_account_user(prefix_owner_id: int, sender_id: int) -> int:
-    """Resolve which finance account a prefixed self-command should use.
+def resolve_prefixed_branch_account_user(prefix_owner_id: int, sender_id: int, private_chat_user_id: int) -> int:
+    """Resolve which user account a prefixed private-chat command should use.
 
-    Prefixed branch commands are expected to operate on the account that owns
-    the matched prefix, so users registered under an owner/super admin see and
-    use that branch account instead of their own personal finance record.
+    In a private chat, the branch owner may send commands while talking directly
+    to one of their managed users. In that case the command should affect the
+    chat user, not the sender/owner. For regular branch users messaging from
+    their own private chat, the sender and chat user are the same person.
     """
-    if is_registered_under_branch(prefix_owner_id, sender_id):
-        return int(prefix_owner_id)
+    if sender_id == prefix_owner_id and is_registered_under_branch(prefix_owner_id, private_chat_user_id):
+        return int(private_chat_user_id)
     return int(sender_id)
 
 
@@ -2774,10 +2790,6 @@ async def prefix_command_handler(event):
     prefix = command_match.group(1)
     action = command_match.group(2).lower()
     argument_text = (command_match.group(3) or '').strip()
-    prefix_owner_id = resolve_prefix_owner_for_user(sender_id, prefix)
-    if prefix_owner_id is None:
-        return
-
     try:
         private_chat = await event.get_chat()
     except Exception as e:
@@ -2787,6 +2799,14 @@ async def prefix_command_handler(event):
     target_user_id = getattr(private_chat, 'id', None)
     if target_user_id is None:
         await event.reply("❌ Could not detect the target user in this private chat.")
+        return
+
+    prefix_owner_id = resolve_prefix_owner_for_private_chat(int(sender_id), int(target_user_id), prefix)
+    if prefix_owner_id is None:
+        await event.reply(
+            f"❌ Prefix `{prefix}` is not active for this account.\n"
+            "Ask your manager to set the prefix again and register this user under that branch."
+        )
         return
 
     async with STATE_LOCK:
@@ -2848,7 +2868,11 @@ async def prefix_command_handler(event):
         return
 
     if action == "balance":
-        branch_user_id = int(sender_id)
+        branch_user_id = resolve_prefixed_branch_account_user(
+            prefix_owner_id,
+            int(sender_id),
+            int(target_user_id),
+        )
         if not is_registered_under_branch(prefix_owner_id, branch_user_id):
             await event.reply("❌ This user is not registered under your branch.")
             return
@@ -2873,8 +2897,7 @@ async def prefix_command_handler(event):
 
             await set_user_balance_command(event, int(target_user_id), amount)
             return
-        branch_account_user_id = resolve_prefixed_branch_account_user(prefix_owner_id, branch_user_id)
-        await send_balance_card(event, branch_account_user_id)
+        await send_balance_card(event, branch_user_id)
         return
 
     if action == "stock":
@@ -2915,16 +2938,18 @@ async def prefix_command_handler(event):
         return
 
     if action == "due":
-        branch_user_id = int(sender_id)
+        branch_user_id = resolve_prefixed_branch_account_user(
+            prefix_owner_id,
+            int(sender_id),
+            int(target_user_id),
+        )
         if not is_registered_under_branch(prefix_owner_id, branch_user_id):
             await event.reply("❌ This user is not registered under your branch.")
             return
 
-        branch_account_user_id = resolve_prefixed_branch_account_user(prefix_owner_id, branch_user_id)
-
         parts = argument_text.split() if argument_text else []
         if not parts:
-            await send_due_summary_card(event, branch_account_user_id)
+            await send_due_summary_card(event, branch_user_id)
             return
 
         category = parts[0]
@@ -2939,7 +2964,7 @@ async def prefix_command_handler(event):
                 return
             quantity = int(parts[1])
 
-        await purchase_uc_with_due(event, prefix_owner_id, branch_account_user_id, category, quantity)
+        await purchase_uc_with_due(event, prefix_owner_id, branch_user_id, category, quantity)
         return
 
     if action == "clear":
@@ -2959,12 +2984,14 @@ async def prefix_command_handler(event):
         return
 
     if action == "tp":
-        branch_user_id = int(sender_id)
+        branch_user_id = resolve_prefixed_branch_account_user(
+            prefix_owner_id,
+            int(sender_id),
+            int(target_user_id),
+        )
         if not is_registered_under_branch(prefix_owner_id, branch_user_id):
             await event.reply("❌ This user is not registered under your branch.")
             return
-
-        branch_account_user_id = resolve_prefixed_branch_account_user(prefix_owner_id, branch_user_id)
 
         parts = argument_text.split() if argument_text else []
         if len(parts) < 2:
@@ -2989,7 +3016,7 @@ async def prefix_command_handler(event):
                 return
             quantity = int(parts[2])
 
-        await topup_with_uc_codes(event, prefix_owner_id, branch_account_user_id, uid, diamond_key, quantity)
+        await topup_with_uc_codes(event, prefix_owner_id, branch_user_id, uid, diamond_key, quantity)
         return
 
     if action in set(UC_STOCK_CATEGORY_ORDER):
@@ -3019,7 +3046,7 @@ async def prefix_command_handler(event):
 
 
 client.add_event_handler(calculator_message_handler, events.NewMessage(outgoing=True))
-client.add_event_handler(prefix_command_handler, events.NewMessage(outgoing=True))
+client.add_event_handler(prefix_command_handler, events.NewMessage())
 
 
 HANDLER_SPECS = [
@@ -3044,7 +3071,7 @@ def register_handlers(target_client):
     for handler, pattern in HANDLER_SPECS:
         target_client.add_event_handler(handler, events.NewMessage(pattern=pattern, outgoing=True))
     target_client.add_event_handler(calculator_message_handler, events.NewMessage(outgoing=True))
-    target_client.add_event_handler(prefix_command_handler, events.NewMessage(outgoing=True))
+    target_client.add_event_handler(prefix_command_handler, events.NewMessage())
 
 
 async def start_super_admin_clients():
