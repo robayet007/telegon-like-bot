@@ -1094,6 +1094,27 @@ def get_event_client(event):
     return getattr(event, 'client', MAIN_CLIENT)
 
 
+def get_client_for_branch_owner(owner_user_id: int | None):
+    """Return the Telegram client that should answer for a branch owner."""
+    if owner_user_id is not None and owner_user_id in SUPER_ADMIN_CLIENTS:
+        return SUPER_ADMIN_CLIENTS[owner_user_id]
+    return MAIN_CLIENT
+
+
+async def reply_via_branch_owner(event, owner_user_id: int | None, message: str):
+    """Reply from the branch-owner account when a prefixed command resolves there."""
+    target_client = get_client_for_branch_owner(owner_user_id)
+    event_client = get_event_client(event)
+    if target_client == event_client:
+        return await event.reply(message)
+
+    reply_to = getattr(getattr(event, 'message', None), 'id', None) or getattr(event, 'id', None)
+    try:
+        return await target_client.send_message(event.chat_id, message, reply_to=reply_to)
+    except Exception:
+        return await event.reply(message)
+
+
 def is_known_super_admin_identity(sender_id: int, sender_username: str | None) -> bool:
     """Check super admin access by stored id or verified credential identity."""
     if sender_id in SUPER_ADMIN_USERS:
@@ -1478,7 +1499,7 @@ async def set_due_limit_for_managed_user(event, target_user_id: int, amount: Dec
     )
 
 
-async def send_balance_card(event, target_user_id: int):
+async def send_balance_card(event, target_user_id: int, owner_user_id: int | None = None):
     """Show the internal payment snapshot for a branch member."""
     async with STATE_LOCK:
         finance = get_user_finance(target_user_id)
@@ -1494,21 +1515,23 @@ async def send_balance_card(event, target_user_id: int):
         f"Due Limit : {format_money_amount(finance['due_limit'])} Tk",
         "───────────────────────────",
     ]
-    await event.reply("\n".join(lines))
+    await reply_via_branch_owner(event, owner_user_id, "\n".join(lines))
 
 
 async def send_stock_card(event, owner_user_id: int):
     """Show branch UC stock summary."""
     async with STATE_LOCK:
         message = build_stock_summary_message(owner_user_id)
-    await event.reply(message)
+    await reply_via_branch_owner(event, owner_user_id, message)
 
 
 async def add_branch_stock_from_text(event, owner_user_id: int, raw_stock_text: str):
     """Parse and store UC stock codes for one branch owner."""
     entries, ignored_lines = extract_uc_stock_entries(raw_stock_text)
     if not entries:
-        await event.reply(
+        await reply_via_branch_owner(
+            event,
+            owner_user_id,
             "❌ No valid UC stock codes found in your message.\n"
             f"➪ Ignored : {ignored_lines} ʟɪɴᴇs"
         )
@@ -1526,7 +1549,9 @@ async def add_branch_stock_from_text(event, owner_user_id: int, raw_stock_text: 
             preview_lines.append(f"{entry['code_head']} {entry['code_tail']} [{entry['category']} UC]")
         duplicate_preview = "\n➪ Already :\n" + "\n".join(preview_lines)
 
-    await event.reply(
+    await reply_via_branch_owner(
+        event,
+        owner_user_id,
         f"✅ 𝗦𝘁𝗼𝗰𝗸 𝗨𝗽𝗱𝗮𝘁𝗲𝗱\n\n"
         f"➪ Found   : {len(entries)} ᴄᴏᴅᴇs\n"
         f"➪ Added   : {added_count} ᴄᴏᴅᴇs\n"
@@ -1541,7 +1566,7 @@ async def send_rate_card(event, owner_user_id: int):
     """Show branch UC rates."""
     async with STATE_LOCK:
         message = build_rate_list_message(owner_user_id)
-    await event.reply(message)
+    await reply_via_branch_owner(event, owner_user_id, message)
 
 
 async def send_prefix_help_card(event, prefix: str, prefix_owner_id: int, sender_id: int):
@@ -1584,7 +1609,7 @@ async def send_prefix_help_card(event, prefix: str, prefix_owner_id: int, sender
             f"- `{prefix}2000 <price>`",
         ])
 
-    await event.reply("\n".join(user_lines))
+    await reply_via_branch_owner(event, prefix_owner_id, "\n".join(user_lines))
 
 
 async def set_branch_rate_command(event, owner_user_id: int, category: str, price: Decimal):
@@ -1593,10 +1618,14 @@ async def set_branch_rate_command(event, owner_user_id: int, category: str, pric
         set_branch_rate(owner_user_id, category, price)
         save_state()
 
-    await event.reply(f"✅ 𝗥𝗮𝘁𝗲 `{category} UC` 𝘀𝗲𝘁 𝘁𝗼 `{format_money_amount(price)}` 𝗕ᴀɴᴋ")
+    await reply_via_branch_owner(
+        event,
+        owner_user_id,
+        f"✅ 𝗥𝗮𝘁𝗲 `{category} UC` 𝘀𝗲𝘁 𝘁𝗼 `{format_money_amount(price)}` 𝗕ᴀɴᴋ"
+    )
 
 
-async def send_due_summary_card(event, target_user_id: int):
+async def send_due_summary_card(event, target_user_id: int, owner_user_id: int | None = None):
     """Show the user's purchased products and total due."""
     async with STATE_LOCK:
         finance = get_user_finance(target_user_id)
@@ -1635,10 +1664,10 @@ async def send_due_summary_card(event, target_user_id: int):
 
     lines.append("▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔")
     lines.append(f"☞︎︎︎ Tᴏᴛᴀʟ Dᴜᴇ ➪ {format_money_amount(finance['due'])} Tᴋ")
-    await event.reply("\n".join(lines))
+    await reply_via_branch_owner(event, owner_user_id, "\n".join(lines))
 
 
-async def clear_user_due_command(event, target_user_id: int):
+async def clear_user_due_command(event, target_user_id: int, owner_user_id: int | None = None):
     """Clear a user's due amount and purchase summary."""
     async with STATE_LOCK:
         ensure_user_finance_record(target_user_id)
@@ -1651,14 +1680,16 @@ async def clear_user_due_command(event, target_user_id: int):
         profile = USER_PROFILES.get(target_user_id, {}).copy()
 
     customer_name = profile.get('name') or (f"@{profile['username']}" if profile.get('username') else str(target_user_id))
-    await event.reply(
+    await reply_via_branch_owner(
+        event,
+        owner_user_id,
         f"- Dᴜᴇ Cʟᴇᴀʀ Oғ {customer_name} !\n\n"
         f"- Dᴜᴇ Aᴍᴍᴏᴜɴᴛ : {format_money_amount(cleared_due)} Tᴋ \n\n"
         "Tʜᴀɴᴋs Fᴏʀ Yᴏᴜʀ Sᴜᴘᴘᴏʀᴛ ❤️❤️"
     )
 
 
-async def set_user_balance_command(event, target_user_id: int, amount: Decimal):
+async def set_user_balance_command(event, target_user_id: int, amount: Decimal, owner_user_id: int | None = None):
     """Set a user's balance amount."""
     async with STATE_LOCK:
         set_user_balance(target_user_id, amount)
@@ -1666,7 +1697,9 @@ async def set_user_balance_command(event, target_user_id: int, amount: Decimal):
         profile = USER_PROFILES.get(target_user_id, {}).copy()
 
     customer_name = profile.get('name') or (f"@{profile['username']}" if profile.get('username') else str(target_user_id))
-    await event.reply(
+    await reply_via_branch_owner(
+        event,
+        owner_user_id,
         f"✅ Bᴀʟᴀɴᴄᴇ Uᴘᴅᴀᴛᴇᴅ Oғ {customer_name} !\n\n"
         f"💳 Bᴀʟᴀɴᴄᴇ Aᴍᴏᴜɴᴛ : {format_money_amount(amount)} Tᴋ"
     )
@@ -1675,7 +1708,7 @@ async def set_user_balance_command(event, target_user_id: int, amount: Decimal):
 async def purchase_uc_with_due(event, owner_user_id: int, target_user_id: int, category: str, quantity: int):
     """Sell UC stock to a branch user using their due limit."""
     if quantity <= 0:
-        await event.reply("❌ Quantity must be at least 1.")
+        await reply_via_branch_owner(event, owner_user_id, "❌ Quantity must be at least 1.")
         return
 
     async with STATE_LOCK:
@@ -1683,7 +1716,9 @@ async def purchase_uc_with_due(event, owner_user_id: int, target_user_id: int, c
         counts, _ = get_branch_stock_snapshot(owner_user_id)
         available_stock = counts.get(category, 0)
         if available_stock < quantity:
-            await event.reply(
+            await reply_via_branch_owner(
+                event,
+                owner_user_id,
                 f"❌ Not enough stock.\n"
                 f"➪ Category : {category} UC\n"
                 f"➪ Need     : {quantity}\n"
@@ -1693,7 +1728,7 @@ async def purchase_uc_with_due(event, owner_user_id: int, target_user_id: int, c
 
         unit_price = get_branch_rate(owner_user_id, category)
         if unit_price <= 0:
-            await event.reply(f"❌ Rate for `{category} UC` is not set.")
+            await reply_via_branch_owner(event, owner_user_id, f"❌ Rate for `{category} UC` is not set.")
             return
 
         finance = USER_FINANCE[target_user_id]
@@ -1701,7 +1736,9 @@ async def purchase_uc_with_due(event, owner_user_id: int, target_user_id: int, c
         due_limit = Decimal(finance.get('due_limit', '0'))
         total_price = unit_price * Decimal(quantity)
         if current_due + total_price > due_limit:
-            await event.reply(
+            await reply_via_branch_owner(
+                event,
+                owner_user_id,
                 "❌ Due limit exceeded.\n"
                 f"➪ Current Due : {format_money_amount(current_due)} Tk\n"
                 f"➪ Due Limit   : {format_money_amount(due_limit)} Tk\n"
@@ -1711,7 +1748,7 @@ async def purchase_uc_with_due(event, owner_user_id: int, target_user_id: int, c
 
         codes = pop_branch_stock_entries(owner_user_id, category, quantity)
         if len(codes) != quantity:
-            await event.reply("❌ Could not reserve the requested stock. Please try again.")
+            await reply_via_branch_owner(event, owner_user_id, "❌ Could not reserve the requested stock. Please try again.")
             return
 
         finance['due'] = str(current_due + total_price)
@@ -1727,7 +1764,9 @@ async def purchase_uc_with_due(event, owner_user_id: int, target_user_id: int, c
         code_lines.append(
             f"{number_emoji} `{full_code}`"
         )
-    await event.reply(
+    await reply_via_branch_owner(
+        event,
+        owner_user_id,
         "✅ 𝗗𝘂𝗲 𝗢𝗿𝗱𝗲𝗿 𝗦𝘂𝗰𝗰𝗲𝘀𝘀𝗳𝘂𝗹\n\n"
         f"👤 Buyer    : {buyer_name}\n"
         f"📦 Product  : {category} UC\n"
@@ -1784,7 +1823,9 @@ async def topup_with_uc_codes(event, owner_user_id: int, target_user_id: int, ui
     category = product['category']
     product_label = product['label']
     fee_per_unit = product['fee']
-    processing_msg = await event.reply(
+    processing_msg = await reply_via_branch_owner(
+        event,
+        owner_user_id,
         f"⏳ Processing {product_label} topup...\n"
         f"UID: `{uid}`\n"
         f"Quantity: `{quantity}`"
@@ -1906,7 +1947,7 @@ async def topup_with_uc_codes(event, owner_user_id: int, target_user_id: int, ui
     try:
         await processing_msg.edit(final_message)
     except Exception:
-        await event.reply(final_message)
+        await reply_via_branch_owner(event, owner_user_id, final_message)
 
 
 async def start_super_admin_verification(event, target_user_id: int):
@@ -2918,6 +2959,9 @@ async def alllimit_command_handler(event):
 
 async def calculator_message_handler(event):
     """Auto-calculate plain arithmetic messages in chats and groups."""
+    if await should_ignore_privileged_incoming_private_command(event):
+        return
+
     if not getattr(event, 'raw_text', None):
         return
 
@@ -2966,9 +3010,6 @@ async def prefix_command_handler(event):
         )
         return
 
-    if not event.is_private:
-        return
-
     command_match = re.match(r'(?is)^([A-Za-z])(\w+)(?:\s+([\s\S]+))?$', text)
     if not command_match:
         return
@@ -2993,24 +3034,40 @@ async def prefix_command_handler(event):
     if action not in supported_prefixed_actions:
         return
 
-    try:
-        private_chat = await event.get_chat()
-    except Exception as e:
-        await event.reply(f"❌ Could not resolve private chat user.\nError: `{e}`")
-        return
+    target_user_id = int(branch_actor_user_id)
+    prefix_owner_id = resolve_prefix_owner_for_user(int(branch_actor_user_id), prefix)
 
-    target_user_id = getattr(private_chat, 'id', None)
-    if target_user_id is None:
-        await event.reply("❌ Could not detect the target user in this private chat.")
-        return
+    if event.is_private:
+        try:
+            private_chat = await event.get_chat()
+        except Exception as e:
+            await event.reply(f"❌ Could not resolve private chat user.\nError: `{e}`")
+            return
 
-    prefix_owner_id = resolve_prefix_owner_for_private_chat(int(branch_actor_user_id), int(target_user_id), prefix)
-    if prefix_owner_id is None:
-        return
+        target_user_id = getattr(private_chat, 'id', None)
+        if target_user_id is None:
+            await event.reply("❌ Could not detect the target user in this private chat.")
+            return
 
-    async with STATE_LOCK:
-        cache_entity_profile(private_chat)
-        save_state()
+        prefix_owner_id = resolve_prefix_owner_for_private_chat(int(branch_actor_user_id), int(target_user_id), prefix)
+        if prefix_owner_id is None:
+            return
+
+        async with STATE_LOCK:
+            cache_entity_profile(private_chat)
+            save_state()
+    else:
+        if prefix_owner_id is None:
+            return
+
+    if not event.is_private and action in {
+        "signup",
+        "signout",
+        "duelimit",
+        "clear",
+        "stockadd",
+    }.union(set(UC_STOCK_CATEGORY_ORDER)):
+        return
 
     if action == "signup":
         if prefix_owner_id != branch_actor_user_id:
@@ -3094,9 +3151,9 @@ async def prefix_command_handler(event):
                 await event.reply("❌ Balance cannot be negative.")
                 return
 
-            await set_user_balance_command(event, int(target_user_id), amount)
+            await set_user_balance_command(event, int(target_user_id), amount, prefix_owner_id)
             return
-        await send_balance_card(event, branch_user_id)
+        await send_balance_card(event, branch_user_id, prefix_owner_id)
         return
 
     if action == "stock":
@@ -3148,7 +3205,7 @@ async def prefix_command_handler(event):
 
         parts = argument_text.split() if argument_text else []
         if not parts:
-            await send_due_summary_card(event, branch_user_id)
+            await send_due_summary_card(event, branch_user_id, prefix_owner_id)
             return
 
         category = parts[0]
@@ -3179,7 +3236,7 @@ async def prefix_command_handler(event):
             await event.reply("❌ This user is not registered under your branch.")
             return
 
-        await clear_user_due_command(event, int(target_user_id))
+        await clear_user_due_command(event, int(target_user_id), prefix_owner_id)
         return
 
     if action == "tp":
@@ -3245,6 +3302,7 @@ async def prefix_command_handler(event):
 
 
 client.add_event_handler(calculator_message_handler, events.NewMessage(outgoing=True))
+client.add_event_handler(calculator_message_handler, events.NewMessage(incoming=True))
 client.add_event_handler(prefix_command_handler, events.NewMessage())
 client.add_event_handler(start_command_handler, events.NewMessage(pattern=START_PATTERN, incoming=True))
 client.add_event_handler(help_command_handler, events.NewMessage(pattern=HELP_PATTERN, incoming=True))
@@ -3278,6 +3336,7 @@ def register_handlers(target_client):
     for handler, pattern in HANDLER_SPECS:
         target_client.add_event_handler(handler, events.NewMessage(pattern=pattern, outgoing=True))
     target_client.add_event_handler(calculator_message_handler, events.NewMessage(outgoing=True))
+    target_client.add_event_handler(calculator_message_handler, events.NewMessage(incoming=True))
     target_client.add_event_handler(prefix_command_handler, events.NewMessage())
     target_client.add_event_handler(start_command_handler, events.NewMessage(pattern=START_PATTERN, incoming=True))
     target_client.add_event_handler(help_command_handler, events.NewMessage(pattern=HELP_PATTERN, incoming=True))
