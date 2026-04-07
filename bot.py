@@ -1180,28 +1180,14 @@ async def should_ignore_privileged_incoming_private_command(event) -> bool:
     if sender_id is None:
         return False
 
-    event_client = get_event_client(event)
-    me = await event_client.get_me()
-    receiver_id = getattr(me, 'id', None)
-    receiver_username = getattr(me, 'username', None)
-
-    if receiver_id is None or receiver_id == sender_id:
-        return False
-
     owner = await MAIN_CLIENT.get_me()
     owner_id = getattr(owner, 'id', None)
 
-    sender_is_privileged = (
+    return (
         sender_id == owner_id
         or sender_id in ADMIN_USERS
         or is_known_super_admin_identity(sender_id, sender_username)
     )
-    receiver_is_privileged = (
-        receiver_id == owner_id
-        or receiver_id in ADMIN_USERS
-        or is_known_super_admin_identity(receiver_id, receiver_username)
-    )
-    return sender_is_privileged and receiver_is_privileged
 
 
 async def can_create_super_admin(event) -> bool:
@@ -1737,9 +1723,9 @@ async def purchase_uc_with_due(event, owner_user_id: int, target_user_id: int, c
     code_lines = []
     for index, item in enumerate(codes, start=1):
         number_emoji = f"{index}️⃣" if index <= 9 else f"{index}."
+        full_code = f"{item['code_head']} {item['code_tail']}"
         code_lines.append(
-            f"{number_emoji} {item['code_head']}\n"
-            f"    {item['code_tail']}"
+            f"{number_emoji} `{full_code}`"
         )
     await event.reply(
         "✅ 𝗗𝘂𝗲 𝗢𝗿𝗱𝗲𝗿 𝗦𝘂𝗰𝗰𝗲𝘀𝘀𝗳𝘂𝗹\n\n"
