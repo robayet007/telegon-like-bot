@@ -2432,7 +2432,10 @@ async def setsuperadmin_command_handler(event):
     await start_super_admin_verification(event, target_user_id)
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?superauth\s+(\d+)\s+([A-Za-z0-9]+)\s+(.+)$'))
+SUPERAUTH_PATTERN = r'(?i)^/?superauth\s+(\d+)\s+([A-Za-z0-9]+)\s+(.+)$'
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=SUPERAUTH_PATTERN))
 async def superauth_command_handler(event):
     """
     Submit credentials for pending super admin verification.
@@ -2440,7 +2443,7 @@ async def superauth_command_handler(event):
       /superauth <api_id> <api_hash> <session_string>
     """
     text = event.raw_text.strip()
-    match = re.match(r'(?i)^/?superauth\s+(\d+)\s+([A-Za-z0-9]+)\s+(.+)$', text)
+    match = re.match(SUPERAUTH_PATTERN, text)
     if not match:
         await event.reply(
             "❌ Invalid format.\n"
@@ -3060,6 +3063,8 @@ async def prefix_command_handler(event):
 
 client.add_event_handler(calculator_message_handler, events.NewMessage(outgoing=True))
 client.add_event_handler(prefix_command_handler, events.NewMessage())
+# Pending super admins send `superauth` to the main account as an incoming DM.
+client.add_event_handler(superauth_command_handler, events.NewMessage(pattern=SUPERAUTH_PATTERN, incoming=True))
 
 
 HANDLER_SPECS = [
@@ -3069,7 +3074,7 @@ HANDLER_SPECS = [
     (setadmin_command_handler, r'(?i)^/?setadmin\s+(@?\w+)$'),
     (removeadmin_command_handler, r'(?i)^/?removeadmin\s+(@?\w+)$'),
     (setsuperadmin_command_handler, r'(?i)^/?setsuperadmin\s+(@?\w+)$'),
-    (superauth_command_handler, r'(?i)^/?superauth\s+(\d+)\s+([A-Za-z0-9]+)\s+(.+)$'),
+    (superauth_command_handler, SUPERAUTH_PATTERN),
     (setsplimit_command_handler, r'(?i)^/?setsplimit\s+(\d+)\s+(@?\w+)\s+(100|200)$'),
     (setlimit_command_handler, r'(?i)^/?setlimit\s+(\d+)(?:\s+(@?\w+))?\s+(100|200)$'),
     (resetlimit_command_handler, r'(?i)^/?resetlimit(?:\s+(@?\w+))?$'),
