@@ -656,6 +656,11 @@ def user_owns_exact_prefix(user_id: int, prefix_text: str) -> bool:
     return bool(prefix and prefix.lower() == prefix_text.lower())
 
 
+def is_prefix_manager_account(user_id: int) -> bool:
+    """Return True when a user owns a branch prefix or acts as a super-admin manager."""
+    return user_id in SUPER_ADMIN_USERS or bool(get_manager_prefix(user_id))
+
+
 def is_registered_under_branch(prefix_owner_id: int, target_user_id: int) -> bool:
     """Return True when a target belongs to the prefix owner's branch."""
     if target_user_id == prefix_owner_id:
@@ -1642,8 +1647,10 @@ async def send_prefixed_access_card(event, prefix: str, prefix_owner_id: int, se
 
     if sender_id == prefix_owner_id:
         role = "Owner" if await is_owner(event) else "Super Admin"
-    elif sender_id in ADMIN_USERS:
+    elif branch_actor_user_id in ADMIN_USERS and branch_actor_user_id not in SUPER_ADMIN_USERS and get_manager_id(branch_actor_user_id) == prefix_owner_id:
         role = "Admin"
+    elif is_registered_under_branch(prefix_owner_id, int(branch_actor_user_id)):
+        role = "User"
     else:
         role = "User"
 
@@ -1655,6 +1662,7 @@ async def send_prefixed_access_card(event, prefix: str, prefix_owner_id: int, se
         f"🏷 Username: `{('@' + sender_username) if sender_username else 'N/A'}`\n"
         f"🛡 Role: `{role}`\n"
         f"👤 Branch ID: `{branch_actor_user_id or 'N/A'}`\n"
+        f"👤 Manager ID: `{get_manager_id(branch_actor_user_id) or 'N/A'}`\n"
         f"👤 Prefix Owner: `{prefix_owner_id}`\n"
         f"🔑 Prefix: `{prefix}`"
     )
