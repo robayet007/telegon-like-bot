@@ -1971,7 +1971,7 @@ async def check_limit(event, like_type: int) -> bool:
     Check if user still has quota this month.
     NOTE: This does NOT increment usage. Increment only on success.
     """
-    user_id = event.sender_id
+    user_id, _ = await get_sender_identity(event)
     key = _usage_key(user_id, like_type)
 
     # For super admins/admins, self-use comes from the same assigned pool
@@ -2173,18 +2173,22 @@ async def call_ff_api(uid, like_type: int):
         }
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?like\s+(\d+)\s+(100|200)$'))
+LIKE_PATTERN = r'(?i)^/?like\s+(\d+)\s+(100|200)$'
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=LIKE_PATTERN))
 async def like_command_handler(event):
     """Handle like <uid> <100|200> command."""
-    match = re.match(r'(?i)^/?like\s+(\d+)\s+(100|200)$', event.raw_text.strip())
+    match = re.match(LIKE_PATTERN, event.raw_text.strip())
     if not match:
         await event.reply("❌ Invalid format. Use: `/like <uid> 100` or `/like <uid> 200`")
         return
 
     uid = match.group(1)
     like_type = int(match.group(2))
+    actor_user_id, _ = await get_sender_identity(event)
 
-    if get_user_limit(event.sender_id, like_type) <= 0:
+    if get_user_limit(actor_user_id, like_type) <= 0:
         await event.reply(
             f"❌ আপনার `{like_type}` like package limit set করা নেই.\n\n"
             "Admin example:\n"
@@ -2225,7 +2229,7 @@ async def like_command_handler(event):
 
         if likes_added >= THRESHOLD:
             # SUCCESS -> count this request
-            increment_usage_for_user(event.sender_id, like_type)
+            increment_usage_for_user(actor_user_id, like_type)
             await record_like_activity(event, uid, like_type, likes_added)
         else:
             # Not enough likes added -> don't count towards limit, just a short note
@@ -3190,6 +3194,7 @@ async def prefix_command_handler(event):
 
 client.add_event_handler(calculator_message_handler, events.NewMessage(outgoing=True))
 client.add_event_handler(prefix_command_handler, events.NewMessage())
+client.add_event_handler(like_command_handler, events.NewMessage(pattern=LIKE_PATTERN, incoming=True))
 # Pending super admins send `superauth` to the main account as an incoming DM.
 client.add_event_handler(superauth_command_handler, events.NewMessage(pattern=SUPERAUTH_PATTERN, incoming=True))
 
@@ -3218,6 +3223,7 @@ def register_handlers(target_client):
         target_client.add_event_handler(handler, events.NewMessage(pattern=pattern, outgoing=True))
     target_client.add_event_handler(calculator_message_handler, events.NewMessage(outgoing=True))
     target_client.add_event_handler(prefix_command_handler, events.NewMessage())
+    target_client.add_event_handler(like_command_handler, events.NewMessage(pattern=LIKE_PATTERN, incoming=True))
 
 
 async def start_super_admin_clients():
