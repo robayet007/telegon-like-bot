@@ -1267,6 +1267,61 @@ async def remove_admin_for_user(event, target_user_id: int):
     await event.reply(f"✅ Admin access removed for user `{target_user_id}`")
 
 
+async def remove_super_admin_for_user(event, target_user_id: int):
+    """Remove a verified or pending super admin."""
+    owner = await MAIN_CLIENT.get_me()
+    owner_user_id = owner.id
+
+    if target_user_id == owner_user_id:
+        await event.reply("❌ You cannot remove the main owner from super admin access.")
+        return
+
+    if (
+        target_user_id not in SUPER_ADMIN_USERS
+        and target_user_id not in SUPER_ADMIN_CREDENTIALS
+        and target_user_id not in PENDING_SUPER_ADMINS
+    ):
+        await event.reply(f"❌ User `{target_user_id}` is not a super admin.")
+        return
+
+    creds = SUPER_ADMIN_CREDENTIALS.pop(target_user_id, None)
+    PENDING_SUPER_ADMINS.pop(target_user_id, None)
+
+    verified_account_id = None
+    if creds:
+        raw_verified_account_id = creds.get('verified_account_id')
+        if raw_verified_account_id is not None:
+            verified_account_id = int(raw_verified_account_id)
+
+    super_client = SUPER_ADMIN_CLIENTS.pop(target_user_id, None)
+    if super_client is not None:
+        try:
+            await super_client.disconnect()
+        except Exception:
+            pass
+
+    SUPER_ADMIN_USERS.discard(target_user_id)
+    ADMIN_USERS.discard(target_user_id)
+
+    if verified_account_id is not None:
+        SUPER_ADMIN_USERS.discard(verified_account_id)
+        ADMIN_USERS.discard(verified_account_id)
+
+    for child_user_id in list(get_direct_children(target_user_id)):
+        set_manager_for_user(child_user_id, owner_user_id)
+
+    set_manager_for_user(target_user_id, owner_user_id)
+    MANAGER_PREFIXES.pop(target_user_id, None)
+    UC_STOCK.pop(target_user_id, None)
+    UC_RATES.pop(target_user_id, None)
+
+    save_state()
+    await event.reply(
+        f"✅ Super admin access removed for user `{target_user_id}`\n"
+        f"👤 Reassigned to owner: `{owner_user_id}`"
+    )
+
+
 async def register_user_under_manager(event, target_user_id: int):
     """Attach a regular user to the sender's branch."""
     actor_user_id, _ = await get_sender_identity(event)
@@ -2275,6 +2330,10 @@ async def help_command_handler(event):
   ➤ main admin নতুন super admin request শুরু করবে
   উদাহরণ: `setsuperadmin @testuser`
 
+- `removesuperadmin @username`
+  ➤ main admin verified/pending super admin remove করবে
+  উদাহরণ: `removesuperadmin @testuser`
+
 - `superauth <api_id> <api_hash> <session_string>`
   ➤ invited user নিজের credentials submit করে super admin verify করবে
 
@@ -2397,6 +2456,39 @@ async def removeadmin_command_handler(event):
         return
 
     await remove_admin_for_user(event, target_user_id)
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?removesuperadmin\s+(@?\w+)$'))
+async def removesuperadmin_command_handler(event):
+    """
+    Remove a super admin.
+    Usage:
+      /removesuperadmin @username
+    """
+    await log_access_check(event, "removesuperadmin")
+    if not await is_owner(event):
+        await event.reply(await build_access_denied_message(event, "Owner", "removesuperadmin"))
+        return
+
+    text = event.raw_text.strip()
+    match = re.match(r'(?i)^/?removesuperadmin\s+(@?\w+)$', text)
+    if not match:
+        await event.reply("❌ Invalid format.\nUsage: `/removesuperadmin @username`")
+        return
+
+    username = match.group(1)
+    active_client = get_event_client(event)
+
+    try:
+        entity = await active_client.get_entity(username)
+        cache_entity_profile(entity)
+        save_state()
+        target_user_id = entity.id
+    except Exception as e:
+        await event.reply(f"❌ Could not find user `{username}`\nError: `{e}`")
+        return
+
+    await remove_super_admin_for_user(event, target_user_id)
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?setsuperadmin\s+(@?\w+)$'))
@@ -3074,6 +3166,7 @@ HANDLER_SPECS = [
     (setadmin_command_handler, r'(?i)^/?setadmin\s+(@?\w+)$'),
     (removeadmin_command_handler, r'(?i)^/?removeadmin\s+(@?\w+)$'),
     (setsuperadmin_command_handler, r'(?i)^/?setsuperadmin\s+(@?\w+)$'),
+    (removesuperadmin_command_handler, r'(?i)^/?removesuperadmin\s+(@?\w+)$'),
     (superauth_command_handler, SUPERAUTH_PATTERN),
     (setsplimit_command_handler, r'(?i)^/?setsplimit\s+(\d+)\s+(@?\w+)\s+(100|200)$'),
     (setlimit_command_handler, r'(?i)^/?setlimit\s+(\d+)(?:\s+(@?\w+))?\s+(100|200)$'),
