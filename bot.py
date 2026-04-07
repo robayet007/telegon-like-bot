@@ -43,6 +43,7 @@ else:
 
 MAIN_CLIENT = client
 SUPER_ADMIN_CLIENTS = {}
+RECENT_EVENT_KEYS = {}
 
 # =========================
 # In-memory LIMIT SYSTEM
@@ -1105,6 +1106,27 @@ def get_event_client(event):
     return getattr(event, 'client', MAIN_CLIENT)
 
 
+def should_skip_duplicate_event(event, handler_name: str) -> bool:
+    """Return True when the same message was already processed by this handler."""
+    message_id = getattr(getattr(event, 'message', None), 'id', None) or getattr(event, 'id', None)
+    chat_id = getattr(event, 'chat_id', None)
+    if message_id is None or chat_id is None:
+        return False
+
+    key = (handler_name, int(chat_id), int(message_id))
+    now = time.time()
+
+    expired_keys = [stored_key for stored_key, seen_at in RECENT_EVENT_KEYS.items() if now - seen_at > 30]
+    for stored_key in expired_keys:
+        RECENT_EVENT_KEYS.pop(stored_key, None)
+
+    if key in RECENT_EVENT_KEYS:
+        return True
+
+    RECENT_EVENT_KEYS[key] = now
+    return False
+
+
 def get_client_for_branch_owner(owner_user_id: int | None):
     """Return the Telegram client that should answer for a branch owner."""
     if owner_user_id is not None and owner_user_id in SUPER_ADMIN_CLIENTS:
@@ -1423,9 +1445,9 @@ async def register_user_under_manager(event, target_user_id: int):
     """Attach a regular user to the sender's branch."""
     actor_user_id, _ = await get_sender_identity(event)
 
-    if target_user_id == actor_user_id:
-        await event.reply("❌ You cannot register yourself with signup.")
-        return
+    # if target_user_id == actor_user_id:
+    #     await event.reply("❌ You cannot register yourself with signup.")
+    #     return
 
     existing_manager_id = get_manager_id(target_user_id)
     if existing_manager_id == actor_user_id:
@@ -1464,9 +1486,9 @@ async def signout_user_from_manager(event, target_user_id: int):
     """Remove any managed account from the sender's branch."""
     actor_user_id, _ = await get_sender_identity(event)
 
-    if target_user_id == actor_user_id:
-        await event.reply("❌ You cannot sign out yourself.")
-        return
+    # if target_user_id == actor_user_id:
+    #     await event.reply("❌ You cannot sign out yourself.")
+    #     return
 
     existing_manager_id = get_manager_id(target_user_id)
     if existing_manager_id is None:
@@ -2297,6 +2319,8 @@ async def like_command_handler(event):
     """Handle like <uid> <100|200> command."""
     if await should_ignore_privileged_incoming_private_command(event):
         return
+    if should_skip_duplicate_event(event, "like"):
+        return
 
     match = re.match(LIKE_PATTERN, event.raw_text.strip())
     if not match:
@@ -2370,6 +2394,8 @@ async def start_command_handler(event):
     """Handle start command - works in both groups and private (with or without /)"""
     if await should_ignore_privileged_incoming_private_command(event):
         return
+    if should_skip_duplicate_event(event, "start"):
+        return
 
     is_group = not event.is_private
 
@@ -2408,6 +2434,8 @@ HELP_PATTERN = r'(?i)^/?help$'
 async def help_command_handler(event):
     """Handle help command - works in both groups and private (with or without /)"""
     if await should_ignore_privileged_incoming_private_command(event):
+        return
+    if should_skip_duplicate_event(event, "help"):
         return
 
     is_group = not event.is_private
@@ -2700,6 +2728,8 @@ async def superauth_command_handler(event):
     """
     if await should_ignore_privileged_incoming_private_command(event):
         return
+    if should_skip_duplicate_event(event, "superauth"):
+        return
 
     text = event.raw_text.strip()
     match = re.match(SUPERAUTH_PATTERN, text)
@@ -2862,6 +2892,8 @@ async def mylimit_command_handler(event):
     """
     if await should_ignore_privileged_incoming_private_command(event):
         return
+    if should_skip_duplicate_event(event, "mylimit"):
+        return
 
     user_id, _ = await get_sender_identity(event)
     role = await get_access_role(event)
@@ -2899,6 +2931,8 @@ MYACCESS_PATTERN = r'(?i)^/?myaccess$'
 async def myaccess_command_handler(event):
     """Show the sender's current access level."""
     if await should_ignore_privileged_incoming_private_command(event):
+        return
+    if should_skip_duplicate_event(event, "myaccess"):
         return
 
     await log_access_check(event, "myaccess")
@@ -3017,6 +3051,8 @@ async def calculator_message_handler(event):
     """Auto-calculate plain arithmetic messages in chats and groups."""
     if await should_ignore_privileged_incoming_private_command(event):
         return
+    if should_skip_duplicate_event(event, "calculator"):
+        return
 
     if not getattr(event, 'raw_text', None):
         return
@@ -3037,6 +3073,8 @@ async def calculator_message_handler(event):
 async def prefix_command_handler(event):
     """Handle dynamic setPrefix and branch-aware prefixed commands."""
     if await should_ignore_privileged_incoming_private_command(event):
+        return
+    if should_skip_duplicate_event(event, "prefix"):
         return
 
     if not getattr(event, 'raw_text', None):
