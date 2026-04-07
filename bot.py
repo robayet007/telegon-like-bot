@@ -602,7 +602,7 @@ def increment_user_purchase(user_id: int, product_name: str, quantity: int):
 
 
 def get_prefix_owners_for_user(user_id: int) -> list[int]:
-    """Return self + ancestor chain so branch prefixes can be resolved."""
+    """Return self + ancestor chain for prefix ownership lookup."""
     owners = []
     current_user_id = user_id
     visited = set()
@@ -615,12 +615,23 @@ def get_prefix_owners_for_user(user_id: int) -> list[int]:
     return owners
 
 
-def resolve_prefix_owner_for_user(user_id: int, prefix_text: str) -> int | None:
-    """Find which self/ancestor owns the provided prefix."""
+def get_nearest_prefix_owner(user_id: int) -> int | None:
+    """Return the closest self/ancestor that explicitly owns a branch prefix."""
     for owner_id in get_prefix_owners_for_user(user_id):
-        owner_prefix = get_manager_prefix(owner_id)
-        if owner_prefix and owner_prefix.lower() == prefix_text.lower():
+        if get_manager_prefix(owner_id):
             return owner_id
+    return None
+
+
+def resolve_prefix_owner_for_user(user_id: int, prefix_text: str) -> int | None:
+    """Resolve only the nearest branch prefix owner for this user."""
+    owner_id = get_nearest_prefix_owner(user_id)
+    if owner_id is None:
+        return None
+
+    owner_prefix = get_manager_prefix(owner_id)
+    if owner_prefix and owner_prefix.lower() == prefix_text.lower():
+        return owner_id
     return None
 
 
