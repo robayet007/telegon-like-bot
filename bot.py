@@ -4239,6 +4239,8 @@ async def uccalc_command_handler(event):
 
 async def uc_price_auto_reply_handler(event):
     """Auto-calculate UC totals for incoming styled UC due messages."""
+    if await should_ignore_privileged_incoming_private_command(event):
+        return
     if should_skip_duplicate_event(event, "uc-auto-calc"):
         return
 
@@ -4268,6 +4270,8 @@ async def uc_price_auto_reply_handler(event):
     text = (event.raw_text or '').strip()
     if not text or text.startswith('/'):
         return
+    if "uc calculation result" in normalize_uc_calc_text(text).lower():
+        return
     if has_uc_calc_worth_footer(text):
         return
 
@@ -4280,23 +4284,20 @@ async def uc_price_auto_reply_handler(event):
     candidate_identities.discard('')
 
     source_matched = normalized_source in candidate_identities
+    if not source_matched:
+        return
+
     items = parse_uc_calc_items(text, supported_keys)
     message_looks_right = looks_like_uc_due_message(text, supported_keys)
 
-    if not message_looks_right and not (source_matched and items):
-        print(
-            f"[UC_CALC_SKIP] sender_id={sender_id} sender_username={sender_username} "
-            f"chat_username={chat_username} sender_display={sender_display!r} "
-            f"items={items} text={text!r}"
-        )
+    if not message_looks_right:
         return
 
     if not items:
-        print(f"[UC_CALC_SKIP] source matched but no parsable items in message: {text!r}")
         return
 
     try:
-        await event.reply(build_uc_calc_response(items))
+        await safe_uc_calc_reply(event, build_uc_calc_response(items))
     except Exception as e:
         print(f"⚠️ UC calculator handler error: {e}")
 
