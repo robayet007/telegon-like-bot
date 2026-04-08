@@ -479,6 +479,27 @@ def init_super_admin_storage(owner_user_id: int, mongodb_uri: str):
     SUPER_ADMIN_STATE_COLLECTIONS[owner_user_id] = target_db[MONGODB_STATE_COLLECTION]
 
 
+def ensure_branch_storage_ready(owner_user_id: int | None = None) -> bool:
+    """Ensure the correct Mongo collection handle is ready for one branch."""
+    if owner_user_id is None or owner_user_id == MAIN_BRANCH_OWNER_ID:
+        return state_collection is not None
+
+    if owner_user_id in SUPER_ADMIN_STATE_COLLECTIONS:
+        return True
+
+    creds = SUPER_ADMIN_CREDENTIALS.get(owner_user_id, {})
+    mongodb_uri = creds.get('mongodb_uri')
+    if not mongodb_uri:
+        return False
+
+    try:
+        init_super_admin_storage(owner_user_id, mongodb_uri)
+        return True
+    except Exception as e:
+        print(f"âš ï¸ Failed to initialize branch storage for super admin {owner_user_id}: {e}")
+        return False
+
+
 def _collect_legacy_branch_descendants(user_managers: dict[int, int], root_user_id: int) -> set[int]:
     """Collect one user's full subtree from the legacy shared hierarchy."""
     descendants = set()
@@ -585,6 +606,10 @@ def _load_branch_state_into(branch_state: BranchState, data: dict | None):
         branch_state.topup_order_seq = 0
         return
 
+    stored_owner_user_id = data.get('branch_owner_id')
+    if stored_owner_user_id is not None:
+        branch_state.owner_user_id = int(stored_owner_user_id)
+
     branch_state.user_limits = {
         int(user_id): {int(k): int(v) for k, v in limits.items()}
         for user_id, limits in data.get('user_limits', {}).items()
@@ -660,6 +685,7 @@ def _build_branch_state_payload(branch_state: BranchState, document_id: str) -> 
     """Serialize one branch state object for MongoDB."""
     return {
         '_id': document_id,
+        'branch_owner_id': branch_state.owner_user_id,
         'user_limits': {
             str(user_id): {str(k): v for k, v in limits.items()}
             for user_id, limits in branch_state.user_limits.items()
@@ -768,6 +794,10 @@ def save_main_metadata():
 def load_branch_state(owner_user_id: int | None = None):
     """Load one isolated branch state from MongoDB."""
     branch_state = get_branch_state(owner_user_id)
+    if not ensure_branch_storage_ready(owner_user_id):
+        _load_branch_state_into(branch_state, None)
+        return
+
     collection = get_state_collection_for_owner(owner_user_id)
     if collection is None:
         _load_branch_state_into(branch_state, None)
@@ -785,6 +815,9 @@ def load_branch_state(owner_user_id: int | None = None):
 
 def save_branch_state(owner_user_id: int | None = None):
     """Persist one isolated branch state into its own Mongo collection."""
+    if not ensure_branch_storage_ready(owner_user_id):
+        return
+
     collection = get_state_collection_for_owner(owner_user_id)
     if collection is None:
         return
@@ -1360,6 +1393,37 @@ def increment_user_purchase(user_id: int, product_name: str, quantity: int):
     ensure_user_finance_record(user_id)
     purchases = USER_FINANCE[user_id].setdefault('purchases', {})
     purchases[product_name] = int(purchases.get(product_name, 0)) + int(quantity)
+
+
+def build_charge_plan(finance: dict, total_amount: Decimal) -> dict:
+    """Calculate how a purchase should consume balance first, then due."""
+    balance = Decimal(str(finance.get('balance', '0')))
+    current_due = Decimal(str(finance.get('due', '0')))
+    due_limit = Decimal(str(finance.get('due_limit', '0')))
+
+    use_balance = min(max(balance, Decimal('0')), max(total_amount, Decimal('0')))
+    remaining_after_balance = max(total_amount - use_balance, Decimal('0'))
+    available_due = max(due_limit - current_due, Decimal('0'))
+    use_due = min(remaining_after_balance, available_due)
+    shortage = max(remaining_after_balance - use_due, Decimal('0'))
+
+    return {
+        'total_amount': total_amount,
+        'balance_before': balance,
+        'due_before': current_due,
+        'due_limit': due_limit,
+        'use_balance': use_balance,
+        'use_due': use_due,
+        'shortage': shortage,
+        'balance_after': balance - use_balance,
+        'due_after': current_due + use_due,
+    }
+
+
+def apply_charge_plan(finance: dict, charge_plan: dict):
+    """Apply a previously calculated charge plan to one finance record."""
+    finance['balance'] = str(charge_plan['balance_after'])
+    finance['due'] = str(charge_plan['due_after'])
 
 
 def get_prefix_owners_for_user(user_id: int) -> list[int]:
@@ -2805,6 +2869,218 @@ async def topup_with_uc_codes(event, owner_user_id: int, target_user_id: int, ui
         await reply_via_branch_owner(event, owner_user_id, final_message)
 
 
+async def purchase_uc_with_due(event, owner_user_id: int, target_user_id: int, category: str, quantity: int):
+    """Sell UC stock using balance first, then due limit for the remainder."""
+    if quantity <= 0:
+        await reply_via_branch_owner(event, owner_user_id, "âŒ Quantity must be at least 1.")
+        return
+
+    async with STATE_LOCK:
+        ensure_user_finance_record(target_user_id)
+        counts, _ = get_branch_stock_snapshot(owner_user_id)
+        available_stock = counts.get(category, 0)
+        if available_stock < quantity:
+            await reply_via_branch_owner(
+                event,
+                owner_user_id,
+                f"âŒ Not enough stock.\n"
+                f"âžª Category : {category} UC\n"
+                f"âžª Need     : {quantity}\n"
+                f"âžª Stock    : {available_stock}"
+            )
+            return
+
+        unit_price = get_branch_rate(owner_user_id, category)
+        if unit_price <= 0:
+            await reply_via_branch_owner(event, owner_user_id, f"âŒ Rate for `{category} UC` is not set.")
+            return
+
+        total_price = unit_price * Decimal(quantity)
+        finance = USER_FINANCE[target_user_id]
+        charge_plan = build_charge_plan(finance, total_price)
+        if charge_plan['shortage'] > 0:
+            await reply_via_branch_owner(
+                event,
+                owner_user_id,
+                "âŒ Not enough balance / due limit.\n"
+                f"âžª Total Price : {format_money_amount(total_price)} Tk\n"
+                f"âžª Balance     : {format_money_amount(charge_plan['balance_before'])} Tk\n"
+                f"âžª Current Due : {format_money_amount(charge_plan['due_before'])} Tk\n"
+                f"âžª Due Limit   : {format_money_amount(charge_plan['due_limit'])} Tk\n"
+                f"âžª Need More   : {format_money_amount(charge_plan['shortage'])} Tk"
+            )
+            return
+
+        codes = pop_branch_stock_entries(owner_user_id, category, quantity)
+        if len(codes) != quantity:
+            await reply_via_branch_owner(event, owner_user_id, "âŒ Could not reserve the requested stock. Please try again.")
+            return
+
+        apply_charge_plan(finance, charge_plan)
+        increment_user_purchase(target_user_id, category, quantity)
+        save_state()
+
+    profile = USER_PROFILES.get(target_user_id, {})
+    buyer_name = profile.get('name') or (f"@{profile['username']}" if profile.get('username') else str(target_user_id))
+    code_lines = []
+    for index, item in enumerate(codes, start=1):
+        number_emoji = f"{index}ï¸âƒ£" if index <= 9 else f"{index}."
+        full_code = f"{item['code_head']} {item['code_tail']}"
+        code_lines.append(f"{number_emoji} `{full_code}`")
+
+    await reply_via_branch_owner(
+        event,
+        owner_user_id,
+        "âœ… ð——ð˜‚ð—² ð—¢ð—¿ð—±ð—²ð—¿ ð—¦ð˜‚ð—°ð—°ð—²ð˜€ð˜€ð—³ð˜‚ð—¹\n\n"
+        f"ðŸ‘¤ Buyer        : {buyer_name}\n"
+        f"ðŸ“¦ Product      : {category} UC\n"
+        f"ðŸ”¢ Quantity     : {quantity}\n"
+        f"ðŸ’¸ Price        : {format_money_amount(total_price)} Tk\n"
+        f"ðŸ’³ Balance Used : {format_money_amount(charge_plan['use_balance'])} Tk\n"
+        f"ðŸ§¾ Due Used     : {format_money_amount(charge_plan['use_due'])} Tk\n"
+        f"ðŸ’° Balance Left : {format_money_amount(charge_plan['balance_after'])} Tk\n"
+        f"ðŸ§¾ Total Due    : {format_money_amount(charge_plan['due_after'])} Tk\n\n"
+        "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n"
+        "ðŸ”‘ Codes:\n\n"
+        + "\n\n".join(code_lines)
+        + "\nâ”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”"
+    )
+
+
+async def topup_with_uc_codes(event, owner_user_id: int, target_user_id: int, uid: str, diamond_key: str, quantity: int):
+    """Use balance first, then due limit, to top up a player with UC stock."""
+    product = TOPUP_PRODUCT_MAP[diamond_key]
+    category = product['category']
+    product_label = product['label']
+    fee_per_unit = product['fee']
+    processing_msg = await reply_via_branch_owner(
+        event,
+        owner_user_id,
+        f"â³ Processing {product_label} topup...\n"
+        f"UID: `{uid}`\n"
+        f"Quantity: `{quantity}`"
+    )
+
+    if quantity <= 0 or quantity > 5:
+        await processing_msg.edit("âŒ Quantity must be between 1 and 5.")
+        return
+
+    async with STATE_LOCK:
+        ensure_user_finance_record(target_user_id)
+        counts, _ = get_branch_stock_snapshot(owner_user_id)
+        available_stock = counts.get(category, 0)
+        if available_stock < quantity:
+            await processing_msg.edit(
+                f"âŒ Not enough stock.\n"
+                f"âžª Category : {category} UC\n"
+                f"âžª Need     : {quantity}\n"
+                f"âžª Stock    : {available_stock}"
+            )
+            return
+
+        unit_price = get_branch_rate(owner_user_id, category)
+        if unit_price <= 0:
+            await processing_msg.edit(f"âŒ Rate for `{category} UC` is not set.")
+            return
+
+        finance = USER_FINANCE[target_user_id]
+        total_price = (unit_price + fee_per_unit) * Decimal(quantity)
+        charge_plan = build_charge_plan(finance, total_price)
+        if charge_plan['shortage'] > 0:
+            await processing_msg.edit(
+                "âŒ Not enough balance / due limit.\n"
+                f"âžª Total Price : {format_money_amount(total_price)} Tk\n"
+                f"âžª Balance     : {format_money_amount(charge_plan['balance_before'])} Tk\n"
+                f"âžª Current Due : {format_money_amount(charge_plan['due_before'])} Tk\n"
+                f"âžª Due Limit   : {format_money_amount(charge_plan['due_limit'])} Tk\n"
+                f"âžª Need More   : {format_money_amount(charge_plan['shortage'])} Tk"
+            )
+            return
+
+        reserved_entries, reserved_tokens = reserve_branch_stock_entries(owner_user_id, category, quantity)
+        if len(reserved_entries) != quantity:
+            await processing_msg.edit("âŒ Could not reserve the requested stock. Please try again.")
+            return
+
+        order_id = next_topup_order_id()
+        save_state()
+
+    codes = [f"{item['code_head']} {item['code_tail']}" for item in reserved_entries]
+    response_json, error_message, duration = await call_ucbot_topup_api(order_id, uid, codes)
+
+    if error_message or not response_json:
+        async with STATE_LOCK:
+            restore_branch_stock_tokens(owner_user_id, category, reserved_tokens)
+            save_state()
+        await processing_msg.edit(f"âŒ Topup API failed.\nError: `{error_message or 'Unknown error'}`")
+        return
+
+    batch = response_json.get('batch') or []
+    success_entries = []
+    failed_entries = []
+
+    for entry in batch:
+        code_text = str(entry.get('uc', '')).strip()
+        detail = str(entry.get('detail', '')).strip() or "Unknown"
+        ok = bool(entry.get('ok'))
+        if ok:
+            success_entries.append({'code': code_text, 'detail': detail})
+        else:
+            failed_entries.append({'code': code_text, 'detail': detail})
+
+    async with STATE_LOCK:
+        finance = USER_FINANCE[target_user_id]
+        charged_units = quantity
+        charged_total = (unit_price + fee_per_unit) * Decimal(charged_units)
+        apply_charge_plan(finance, charge_plan)
+        increment_user_purchase(target_user_id, category, charged_units)
+        save_state()
+        total_due = Decimal(finance['due'])
+        balance_left = Decimal(finance['balance'])
+        profile = USER_PROFILES.get(target_user_id, {}).copy()
+
+    username = response_json.get('username') or profile.get('name') or (f"@{profile['username']}" if profile.get('username') else str(target_user_id))
+    batch_lines = []
+    for item in success_entries + failed_entries:
+        batch_lines.append(f"{item['code']}  {item['detail']}")
+
+    if len(success_entries) == quantity and quantity > 0:
+        status_header = f"âœ… {product_label} ðŸ’Ž TOPUP DONE"
+        status_footer = "âœ… à¦†à¦ªà¦¨à¦¾à¦° Top-Up à¦¸à¦®à§à¦ªà¦¨à§à¦¨ à¦¹à¦¯à¦¼à§‡à¦›à§‡ ðŸŽ‰"
+    elif len(success_entries) > 0:
+        status_header = f"âš ï¸ {product_label} ðŸ’Ž TOPUP PARTIAL"
+        status_footer = "âš ï¸ à¦†à¦ªà¦¨à¦¾à¦° Top-Up à¦†à¦‚à¦¶à¦¿à¦• à¦¸à¦®à§à¦ªà¦¨à§à¦¨ à¦¹à¦¯à¦¼à§‡à¦›à§‡"
+    else:
+        status_header = f"âŒ {product_label} ðŸ’Ž TOPUP FAILED"
+        status_footer = "âŒ à¦†à¦ªà¦¨à¦¾à¦° Top-Up à¦¸à¦®à§à¦ªà¦¨à§à¦¨ à¦¹à§Ÿà¦¨à¦¿"
+
+    final_message = (
+        f"{status_header}\n"
+        "â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”\n"
+        f"â”‚ Order ID : #{order_id}\n"
+        f"â”‚ User     : {username}\n"
+        f"â”‚ UID      : {uid}\n"
+        "â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜\n"
+        + ("\n".join(batch_lines) if batch_lines else "No batch details returned.")
+        + "\nâ”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”\n"
+        f"â”‚ Charge : {format_money_amount(charged_total)} à§³ ({format_money_amount(fee_per_unit)}à§³ Fee/Unit)\n"
+        "â”‚\n"
+        f"â”‚ {product_label}  : {len(success_entries)}x\n"
+        f"â”‚ Failed : {len(failed_entries)}x\n"
+        f"â”‚ Balance Used : {format_money_amount(charge_plan['use_balance'])}à§³ \n"
+        f"â”‚ Due Used     : {format_money_amount(charge_plan['use_due'])}à§³ \n"
+        f"â”‚ Balance Left : {format_money_amount(balance_left)}à§³ \n"
+        f"â”‚ Total Due    : {format_money_amount(total_due)}à§³ \n"
+        f"â”‚ Duration : {duration:.2f}s\n"
+        "â””â”€â”€ ðŸ¤– Powered by TelegonBot â”€â”€â”€â”˜\n\n"
+        f"{status_footer}"
+    )
+    try:
+        await processing_msg.edit(final_message)
+    except Exception:
+        await reply_via_branch_owner(event, owner_user_id, final_message)
+
+
 async def start_super_admin_verification(event, target_user_id: int):
     """Start super admin verification flow for a user."""
     actor_user_id, _ = await get_sender_identity(event)
@@ -3460,6 +3736,61 @@ async def help_command_handler(event):
     is_group = not event.is_private
     
     can_manage = await is_admin(event)
+    is_owner_user = await is_owner(event)
+    is_super_admin_user = await is_super_admin(event)
+
+    if can_manage:
+        branch_help = """`like <uid> <100|200>`
+`start`
+`help`
+`mylimit`
+
+**Branch Commands**
+`setprefix <letter>`
+`Xsignup`
+`Xsignout`
+`Xduelimit <amount>`
+`Xbalance`
+`Xbalance <amount>`
+`Xstock`
+`Xstockadd <codes>`
+`Xrate`
+`Xdue`
+`Xdue <category> [qty]`
+`Xclear`
+`Xtp <uid> <diamond> [qty]`
+`X20 <price>` ... `X2000 <price>`"""
+
+        if is_owner_user:
+            owner_help = f"""**Help**
+
+{branch_help}
+
+**Owner Commands**
+`setsuperadmin @username`
+`setlimit <n> <100|200>`
+`setlimit <n> @username <100|200>`
+`removesuperadmin @username`
+`resetlimit`
+`resetlimit @username`
+`alllimit`
+
+`setadmin`, `removeadmin`, and `setsplimit` are removed."""
+            await safe_event_reply(event, owner_help)
+            return
+
+        if is_super_admin_user:
+            super_admin_help = f"""**Help**
+
+{branch_help}
+
+**Superadmin Commands**
+`setlimit <n> @username <100|200>`
+`resetlimit`
+`resetlimit @username`
+`alllimit`"""
+            await safe_event_reply(event, super_admin_help)
+            return
 
     if can_manage:
         manager_help = """ðŸ“– **Help**
