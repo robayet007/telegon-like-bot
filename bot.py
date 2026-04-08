@@ -5,7 +5,9 @@ import hashlib
 import hmac
 import re
 import json
+import sqlite3
 import time
+import unicodedata
 from decimal import Decimal, InvalidOperation, getcontext
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +35,8 @@ MONGODB_STATE_COLLECTION = os.getenv('MONGODB_STATE_COLLECTION', 'bot_state')
 STOCK_TOKEN_SECRET = os.getenv('STOCK_TOKEN_SECRET') or f"{API_HASH}:{API_KEY}"
 UCBOT_TOPUP_URL = os.getenv('UCBOT_TOPUP_URL', 'http://api.ucbot.store/topup-sync')
 UCBOT_AUTH_TOKEN = os.getenv('UCBOT_AUTH_TOKEN', '')
+UC_CALC_DB_PATH = Path(os.getenv('UC_CALC_DB_PATH', Path(__file__).resolve().parent / 'uc_calculator.db'))
+UC_CALC_SOURCE_USERNAME = os.getenv('UC_CALC_SOURCE_USERNAME', 'kaiumrakibucbot').lstrip('@').lower()
 
 # Create Telegram client
 if SESSION_STRING:
@@ -158,6 +162,11 @@ TOPUP_DIAMOND_ALIASES = {
     '1240': '1240',
     '1625': '2530',
     '2530': '2530',
+}
+UC_CALC_DEFAULT_AMOUNTS = {20, 36, 80, 160, 161, 162, 405, 800, 810, 1625}
+UC_CALC_DEFAULT_PACKAGE_KEYS = {
+    '20', '36', '80', '160', '161', '162', '405', '800', '810', '1625',
+    'lvl6', 'lvl10', 'lvl15', 'lvl20', 'lvl25', 'lvl30', 'weeklylite',
 }
 
 
@@ -320,6 +329,219 @@ def init_mongodb():
         mongo_db = None
         state_collection = None
         print(f"⚠️ MongoDB connection failed: {e}")
+
+
+def init_uc_calc_db():
+    """Initialize the standalone UC calculator SQLite database."""
+    UC_CALC_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(UC_CALC_DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS uc_calc_prices (
+                item_key TEXT PRIMARY KEY,
+                item_label TEXT NOT NULL,
+                price TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        legacy_exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='uc_prices'"
+        ).fetchone()
+        if legacy_exists:
+            legacy_rows = conn.execute(
+                "SELECT uc_amount, price, updated_at FROM uc_prices"
+            ).fetchall()
+            for uc_amount, price, updated_at in legacy_rows:
+                item_key = str(int(uc_amount))
+                item_label = f"{item_key} UC"
+                conn.execute(
+                    """
+                    INSERT INTO uc_calc_prices (item_key, item_label, price, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(item_key) DO UPDATE SET
+                        item_label = excluded.item_label,
+                        price = excluded.price,
+                        updated_at = excluded.updated_at
+                    """,
+                    (item_key, item_label, str(price), str(updated_at)),
+                )
+        conn.commit()
+
+
+def normalize_uc_calc_item_key(raw_key: str | int) -> str:
+    """Normalize calculator item keys like 161, lvl15, or weeklylite."""
+    normalized = normalize_uc_calc_text(str(raw_key)).strip().lower()
+    normalized = re.sub(r'[^a-z0-9]+', '', normalized)
+    return normalized
+
+
+def format_uc_calc_item_label(item_key: str) -> str:
+    """Render a readable label for calculator items."""
+    if item_key.isdigit():
+        return f"{item_key} UC"
+    return item_key
+
+
+def set_uc_calc_price(item_key: str | int, price: Decimal):
+    """Save one calculator item price in the standalone calculator database."""
+    normalized_key = normalize_uc_calc_item_key(item_key)
+    item_label = format_uc_calc_item_label(normalized_key)
+    with sqlite3.connect(UC_CALC_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO uc_calc_prices (item_key, item_label, price, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(item_key) DO UPDATE SET
+                item_label = excluded.item_label,
+                price = excluded.price,
+                updated_at = excluded.updated_at
+            """,
+            (normalized_key, item_label, str(price), datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+
+
+def delete_uc_calc_price(item_key: str | int) -> bool:
+    """Delete one configured calculator item price from the standalone calculator database."""
+    normalized_key = normalize_uc_calc_item_key(item_key)
+    with sqlite3.connect(UC_CALC_DB_PATH) as conn:
+        cursor = conn.execute("DELETE FROM uc_calc_prices WHERE item_key = ?", (normalized_key,))
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def get_uc_calc_price(item_key: str | int) -> Decimal | None:
+    """Fetch one calculator item price from the standalone calculator database."""
+    normalized_key = normalize_uc_calc_item_key(item_key)
+    with sqlite3.connect(UC_CALC_DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT price FROM uc_calc_prices WHERE item_key = ?",
+            (normalized_key,),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    try:
+        return Decimal(str(row[0]))
+    except (InvalidOperation, TypeError):
+        return None
+
+
+def list_uc_calc_prices() -> list[tuple[str, str, Decimal]]:
+    """Return all configured calculator prices from the standalone calculator database."""
+    with sqlite3.connect(UC_CALC_DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT item_key, item_label, price FROM uc_calc_prices ORDER BY item_key ASC"
+        ).fetchall()
+
+    prices = []
+    for item_key, item_label, price in rows:
+        try:
+            prices.append((str(item_key), str(item_label), Decimal(str(price))))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+    return prices
+
+
+def normalize_uc_calc_text(text: str) -> str:
+    """Normalize decorated Telegram text so UC calculator parsing stays reliable."""
+    normalized = unicodedata.normalize('NFKC', text or '')
+    normalized = normalized.replace('\ufe0f', '').replace('\ufe0e', '')
+    cleaned_chars = []
+    for char in normalized:
+        if unicodedata.category(char) == 'Mn':
+            continue
+        cleaned_chars.append(char)
+    return ''.join(cleaned_chars)
+
+
+def normalize_identity_text(text: str | None) -> str:
+    """Normalize usernames/display names for loose identity matching."""
+    normalized = normalize_uc_calc_text(text or '').strip().lower()
+    normalized = normalized.replace('@', '')
+    normalized = re.sub(r'[^a-z0-9_]+', '', normalized)
+    return normalized
+
+
+def parse_uc_calc_items(message_text: str, supported_keys: set[str] | None = None) -> list[dict]:
+    """Extract calculator item keys and quantity pairs from formatted due messages."""
+    known_keys = {normalize_uc_calc_item_key(key) for key in (supported_keys or UC_CALC_DEFAULT_PACKAGE_KEYS)}
+    items = []
+    for raw_line in normalize_uc_calc_text(message_text).splitlines():
+        line = raw_line.strip().lower()
+        if not line:
+            continue
+
+        compact_line = normalize_uc_calc_item_key(line)
+        numbers = [int(value) for value in re.findall(r'\d+', line)]
+        if not numbers:
+            continue
+
+        quantity = int(numbers[-1])
+        if quantity <= 0:
+            continue
+
+        matched_key = None
+        for key in sorted(known_keys, key=len, reverse=True):
+            if key and key in compact_line:
+                matched_key = key
+                break
+
+        if matched_key is None:
+            continue
+
+        items.append({'item_key': matched_key, 'quantity': quantity})
+    return items
+
+
+def build_uc_calc_response(items: list[dict]) -> str:
+    """Build calculation summary using standalone UC calculator prices."""
+    lines = ["🧮 **UC Calculation Result**", ""]
+    total = Decimal('0')
+    missing_prices = []
+
+    for item in items:
+        item_key = normalize_uc_calc_item_key(item['item_key'])
+        quantity = int(item['quantity'])
+        item_label = format_uc_calc_item_label(item_key)
+        unit_price = get_uc_calc_price(item_key)
+
+        if unit_price is None:
+            missing_prices.append(item_label)
+            lines.append(f"❌ `{item_label}` x `{quantity}` = price not set")
+            continue
+
+        line_total = unit_price * Decimal(quantity)
+        total += line_total
+        lines.append(
+            f"• `{item_label}` x `{quantity}` = `{format_money_amount(unit_price)}` × `{quantity}` = `{format_money_amount(line_total)}` BDT"
+        )
+
+    lines.extend(["", f"💰 Total = `{format_money_amount(total)}` BDT"])
+
+    if missing_prices:
+        missing_text = ', '.join(sorted(set(missing_prices)))
+        lines.append(f"⚠️ Missing price: `{missing_text}`")
+
+    return "\n".join(lines)
+
+
+def looks_like_uc_due_message(message_text: str, supported_keys: set[str] | None = None) -> bool:
+    """Heuristic check for the styled UC due messages shared in private chat."""
+    normalized = normalize_uc_calc_text(message_text or '').lower()
+    keys = {normalize_uc_calc_item_key(key) for key in (supported_keys or UC_CALC_DEFAULT_PACKAGE_KEYS)}
+    parsed_items = parse_uc_calc_items(message_text, keys)
+    non_empty_lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+
+    has_due_footer = any(len(re.findall(r'\d+', line)) >= 1 for line in non_empty_lines[-2:])
+    has_uc_lines = len(parsed_items) >= 1
+    has_multi_line_layout = len(non_empty_lines) >= 2
+    compact_text = normalize_uc_calc_item_key(normalized)
+    has_known_amount = any(key in compact_text for key in keys)
+
+    return has_uc_lines and has_multi_line_layout and has_known_amount and has_due_footer
 
 
 def load_state():
@@ -3048,6 +3270,193 @@ async def alllimit_command_handler(event):
     await event.reply(msg)
 
 
+@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?setucprice(?:\s+.+)?$'))
+async def setucprice_command_handler(event):
+    """Owner-only command to set one or many standalone calculator item prices."""
+    await log_access_check(event, "setucprice")
+    if not await is_owner(event):
+        await event.reply(await build_access_denied_message(event, "Owner", "setucprice"))
+        return
+
+    match = re.match(r'(?is)^/?setucprice(?:\s+([\s\S]+))?$', event.raw_text.strip())
+    if not match:
+        await event.reply(
+            "❌ Invalid format.\n"
+            "Usage: `/setucprice 161 147` or `/setucprice 20 19 36 35 lvl6 33 800 725`"
+        )
+        return
+
+    argument_text = (match.group(1) or '').strip()
+    parts = argument_text.split()
+    if len(parts) < 2 or len(parts) % 2 != 0:
+        await event.reply(
+            "❌ Invalid format.\n"
+            "Use alternating `item price` pairs.\n"
+            "Example: `/setucprice 20 19 36 35 80 75 lvl6 33 lvl30 100 800 725`"
+        )
+        return
+
+    saved_items = []
+    for index in range(0, len(parts), 2):
+        raw_item_key = parts[index]
+        raw_price = parts[index + 1]
+        item_key = normalize_uc_calc_item_key(raw_item_key)
+
+        try:
+            price = Decimal(raw_price)
+        except InvalidOperation:
+            await event.reply(f"❌ Invalid price for `{raw_item_key}`: `{raw_price}`")
+            return
+
+        if not item_key or price < 0:
+            await event.reply(f"❌ Invalid item/price pair: `{raw_item_key} {raw_price}`")
+            return
+
+        set_uc_calc_price(item_key, price)
+        saved_items.append((item_key, price))
+
+    lines = ["✅ Standalone UC calculator prices saved.", ""]
+    for item_key, price in saved_items:
+        lines.append(f"• `{format_uc_calc_item_label(item_key)}` = `{format_money_amount(price)}` BDT")
+    await event.reply("\n".join(lines))
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?delucprice\s+([a-z0-9]+)$'))
+async def delucprice_command_handler(event):
+    """Owner-only command to delete one standalone UC calculator price."""
+    await log_access_check(event, "delucprice")
+    if not await is_owner(event):
+        await event.reply(await build_access_denied_message(event, "Owner", "delucprice"))
+        return
+
+    match = re.match(r'(?i)^/?delucprice\s+([a-z0-9]+)$', event.raw_text.strip())
+    if not match:
+        await event.reply("❌ Invalid format.\nUsage: `/delucprice 161` or `/delucprice lvl15`")
+        return
+
+    item_key = normalize_uc_calc_item_key(match.group(1))
+    deleted = delete_uc_calc_price(item_key)
+    if not deleted:
+        await event.reply(f"❌ No standalone UC calculator price found for `{format_uc_calc_item_label(item_key)}`.")
+        return
+
+    await event.reply(f"✅ Removed standalone UC calculator price for `{format_uc_calc_item_label(item_key)}`.")
+
+
+UC_PRICES_PATTERN = r'(?i)^/?ucprices$'
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=UC_PRICES_PATTERN))
+async def ucprices_command_handler(event):
+    """Owner-only command to view standalone UC calculator prices."""
+    await log_access_check(event, "ucprices")
+    if not await is_owner(event):
+        await event.reply(await build_access_denied_message(event, "Owner", "ucprices"))
+        return
+
+    prices = list_uc_calc_prices()
+    if not prices:
+        await event.reply(
+            "ℹ️ No standalone UC calculator prices are set yet.\n"
+            "Use `/setucprice <uc_amount> <price>`."
+        )
+        return
+
+    lines = ["🧮 **Standalone UC Calculator Prices**", ""]
+    for item_key, item_label, price in prices:
+        lines.append(f"• `{item_label}` = `{format_money_amount(price)}` BDT")
+    await event.reply("\n".join(lines))
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?uccalc(?:\s+([\s\S]+))?$'))
+async def uccalc_command_handler(event):
+    """Manually calculate UC totals from replied text or inline text."""
+    supported_keys = {item_key for item_key, _, _ in list_uc_calc_prices()}.union(UC_CALC_DEFAULT_PACKAGE_KEYS)
+    match = re.match(r'(?is)^/?uccalc(?:\s+([\s\S]+))?$', event.raw_text.strip())
+    inline_text = (match.group(1) or '').strip() if match else ''
+
+    target_text = inline_text
+    if not target_text and event.is_reply:
+        try:
+            replied = await event.get_reply_message()
+            target_text = getattr(replied, 'raw_text', '') or ''
+        except Exception:
+            target_text = ''
+
+    if not target_text:
+        await event.reply("❌ Reply to the UC message or use `/uccalc <message text>`.")
+        return
+
+    items = parse_uc_calc_items(target_text, supported_keys)
+    if not items:
+        await event.reply("❌ Could not detect any UC quantity lines from that message.")
+        return
+
+    await event.reply(build_uc_calc_response(items))
+
+
+async def uc_price_auto_reply_handler(event):
+    """Auto-calculate UC totals for incoming styled UC due messages."""
+    if should_skip_duplicate_event(event, "uc-auto-calc"):
+        return
+
+    if not getattr(event, 'raw_text', None):
+        return
+
+    if getattr(event, 'outgoing', False):
+        return
+
+    sender_id, sender_username = await get_sender_identity(event)
+
+    chat_username = None
+    sender_display = None
+    try:
+        chat = await event.get_chat()
+        if chat is not None:
+            chat_username = getattr(chat, 'username', None)
+    except Exception:
+        pass
+
+    try:
+        sender_display = await get_sender_display_name(event)
+    except Exception:
+        sender_display = None
+
+    supported_keys = {item_key for item_key, _, _ in list_uc_calc_prices()}.union(UC_CALC_DEFAULT_PACKAGE_KEYS)
+    text = (event.raw_text or '').strip()
+    if not text or text.startswith('/'):
+        return
+
+    normalized_source = normalize_identity_text(UC_CALC_SOURCE_USERNAME)
+    candidate_identities = {
+        normalize_identity_text(sender_username),
+        normalize_identity_text(chat_username),
+        normalize_identity_text(sender_display),
+    }
+    candidate_identities.discard('')
+
+    source_matched = normalized_source in candidate_identities
+    items = parse_uc_calc_items(text, supported_keys)
+    message_looks_right = looks_like_uc_due_message(text, supported_keys)
+
+    if not message_looks_right and not (source_matched and items):
+        print(
+            f"[UC_CALC_SKIP] sender_id={sender_id} sender_username={sender_username} "
+            f"chat_username={chat_username} sender_display={sender_display!r} "
+            f"items={items} text={text!r}"
+        )
+        return
+
+    if not items:
+        print(f"[UC_CALC_SKIP] source matched but no parsable items in message: {text!r}")
+        return
+
+    try:
+        await event.reply(build_uc_calc_response(items))
+    except Exception as e:
+        print(f"⚠️ UC calculator handler error: {e}")
+
+
 async def calculator_message_handler(event):
     """Auto-calculate plain arithmetic messages in chats and groups."""
     if await should_ignore_privileged_incoming_private_command(event):
@@ -3414,6 +3823,7 @@ async def prefix_command_handler(event):
 
 client.add_event_handler(calculator_message_handler, events.NewMessage(outgoing=True))
 client.add_event_handler(calculator_message_handler, events.NewMessage(incoming=True))
+client.add_event_handler(uc_price_auto_reply_handler, events.NewMessage(incoming=True))
 client.add_event_handler(prefix_command_handler, events.NewMessage())
 client.add_event_handler(start_command_handler, events.NewMessage(pattern=START_PATTERN, incoming=True))
 client.add_event_handler(help_command_handler, events.NewMessage(pattern=HELP_PATTERN, incoming=True))
@@ -3448,6 +3858,7 @@ def register_handlers(target_client):
         target_client.add_event_handler(handler, events.NewMessage(pattern=pattern, outgoing=True))
     target_client.add_event_handler(calculator_message_handler, events.NewMessage(outgoing=True))
     target_client.add_event_handler(calculator_message_handler, events.NewMessage(incoming=True))
+    target_client.add_event_handler(uc_price_auto_reply_handler, events.NewMessage(incoming=True))
     target_client.add_event_handler(prefix_command_handler, events.NewMessage())
     target_client.add_event_handler(start_command_handler, events.NewMessage(pattern=START_PATTERN, incoming=True))
     target_client.add_event_handler(help_command_handler, events.NewMessage(pattern=HELP_PATTERN, incoming=True))
@@ -3646,6 +4057,7 @@ async def build_dashboard_payload() -> dict:
 async def main():
     """Main function to start the bot and the built-in dashboard web server."""
     print("🚀 Starting Free Fire Like Bot...")
+    init_uc_calc_db()
     init_mongodb()
     load_state()
     print(

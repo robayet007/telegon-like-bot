@@ -1,6 +1,7 @@
 # Environment variables
 .env
 bot_state.json
+uc_calculator.db
 
 # Telethon session files
 *.session
