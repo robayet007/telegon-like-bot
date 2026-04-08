@@ -9,13 +9,13 @@ import sqlite3
 import time
 import unicodedata
 from decimal import Decimal, InvalidOperation, getcontext
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from telethon import TelegramClient, events
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from telethon.sessions import StringSession
 from dotenv import load_dotenv
 import aiohttp
@@ -167,6 +167,13 @@ UC_CALC_DEFAULT_AMOUNTS = {20, 36, 80, 160, 161, 162, 405, 800, 810, 1625}
 UC_CALC_DEFAULT_PACKAGE_KEYS = {
     '20', '36', '80', '160', '161', '162', '405', '800', '810', '1625',
     'lvl6', 'lvl10', 'lvl15', 'lvl20', 'lvl25', 'lvl30', 'weeklylite',
+}
+UC_CALC_COMMAND_PREFIXES = {
+    'setucprice', 'delucprice', 'ucprices', 'uccalc',
+    'like', 'start', 'help', 'mylimit', 'myaccess',
+    'setadmin', 'removeadmin', 'setsuperadmin', 'removesuperadmin',
+    'superauth', 'setsplimit', 'setlimit', 'resetlimit', 'alllimit',
+    'setprefix',
 }
 
 
@@ -383,6 +390,24 @@ def format_uc_calc_item_label(item_key: str) -> str:
     return item_key
 
 
+def is_uc_calc_command_text(text: str) -> bool:
+    """Return True when text begins with a bot command we should not auto-calculate."""
+    stripped = (text or '').strip()
+    if not stripped:
+        return False
+    first_token = stripped.split()[0].lstrip('/').lower()
+    return first_token in UC_CALC_COMMAND_PREFIXES
+
+
+async def safe_uc_calc_reply(event, message: str):
+    """Reply without crashing on Telegram flood waits."""
+    try:
+        return await event.reply(message)
+    except FloodWaitError as e:
+        print(f"⚠️ UC calculator reply skipped due to FloodWait: wait {e.seconds}s")
+        return None
+
+
 def set_uc_calc_price(item_key: str | int, price: Decimal):
     """Save one calculator item price in the standalone calculator database."""
     normalized_key = normalize_uc_calc_item_key(item_key)
@@ -397,7 +422,7 @@ def set_uc_calc_price(item_key: str | int, price: Decimal):
                 price = excluded.price,
                 updated_at = excluded.updated_at
             """,
-            (normalized_key, item_label, str(price), datetime.utcnow().isoformat()),
+            (normalized_key, item_label, str(price), datetime.now(timezone.utc).isoformat()),
         )
         conn.commit()
 
@@ -1357,18 +1382,36 @@ def get_client_for_branch_owner(owner_user_id: int | None):
     return MAIN_CLIENT
 
 
+async def safe_event_reply(event, message: str, **kwargs):
+    """Reply without crashing when Telegram rate-limits the account."""
+    try:
+        return await event.reply(message, **kwargs)
+    except FloodWaitError as e:
+        print(f"⚠️ FloodWait on event.reply: wait {e.seconds}s chat_id={getattr(event, 'chat_id', None)}")
+        return None
+
+
+async def safe_client_send_message(client, entity, message: str, **kwargs):
+    """Send a message without crashing when Telegram rate-limits the account."""
+    try:
+        return await client.send_message(entity, message, **kwargs)
+    except FloodWaitError as e:
+        print(f"⚠️ FloodWait on send_message: wait {e.seconds}s entity={entity}")
+        return None
+
+
 async def reply_via_branch_owner(event, owner_user_id: int | None, message: str):
     """Reply from the branch-owner account when a prefixed command resolves there."""
     target_client = get_client_for_branch_owner(owner_user_id)
     event_client = get_event_client(event)
     if target_client == event_client:
-        return await event.reply(message)
+        return await safe_event_reply(event, message)
 
     reply_to = getattr(getattr(event, 'message', None), 'id', None) or getattr(event, 'id', None)
-    try:
-        return await target_client.send_message(event.chat_id, message, reply_to=reply_to)
-    except Exception:
-        return await event.reply(message)
+    sent_message = await safe_client_send_message(target_client, event.chat_id, message, reply_to=reply_to)
+    if sent_message is not None:
+        return sent_message
+    return await safe_event_reply(event, message)
 
 
 def is_known_super_admin_identity(sender_id: int, sender_username: str | None) -> bool:
@@ -2647,7 +2690,7 @@ Send likes to Free Fire players using their UID.
 
 **Note:** This bot uses your Telegram account to send commands."""
 
-    await event.reply(help_message)
+    await safe_event_reply(event, help_message)
 
 
 HELP_PATTERN = r'(?i)^/?help$'
@@ -2799,7 +2842,7 @@ async def help_command_handler(event):
 - Slash (`/`) সহ বা ছাড়া – দু’ভাবেই command দেওয়া যাবে
 - Valid UID numeric হতে হবে
 """
-    await event.reply(help_message)
+    await safe_event_reply(event, help_message)
 
 
 # =========================
@@ -3144,7 +3187,7 @@ async def mylimit_command_handler(event):
             distributable = get_remaining_distributable_limit(user_id, like_type)
             lines.append(f"📤 Can Distribute: `{distributable}` request(s)\n")
 
-    await event.reply("\n".join(lines))
+    await safe_uc_calc_reply(event, "\n".join(lines))
 
 
 MYACCESS_PATTERN = r'(?i)^/?myaccess$'
@@ -3305,11 +3348,11 @@ async def setucprice_command_handler(event):
         try:
             price = Decimal(raw_price)
         except InvalidOperation:
-            await event.reply(f"❌ Invalid price for `{raw_item_key}`: `{raw_price}`")
+            await safe_uc_calc_reply(event, f"❌ Invalid price for `{raw_item_key}`: `{raw_price}`")
             return
 
         if not item_key or price < 0:
-            await event.reply(f"❌ Invalid item/price pair: `{raw_item_key} {raw_price}`")
+            await safe_uc_calc_reply(event, f"❌ Invalid item/price pair: `{raw_item_key} {raw_price}`")
             return
 
         set_uc_calc_price(item_key, price)
@@ -3318,7 +3361,7 @@ async def setucprice_command_handler(event):
     lines = ["✅ Standalone UC calculator prices saved.", ""]
     for item_key, price in saved_items:
         lines.append(f"• `{format_uc_calc_item_label(item_key)}` = `{format_money_amount(price)}` BDT")
-    await event.reply("\n".join(lines))
+    await safe_uc_calc_reply(event, "\n".join(lines))
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?delucprice\s+([a-z0-9]+)$'))
@@ -3337,10 +3380,10 @@ async def delucprice_command_handler(event):
     item_key = normalize_uc_calc_item_key(match.group(1))
     deleted = delete_uc_calc_price(item_key)
     if not deleted:
-        await event.reply(f"❌ No standalone UC calculator price found for `{format_uc_calc_item_label(item_key)}`.")
+        await safe_uc_calc_reply(event, f"❌ No standalone UC calculator price found for `{format_uc_calc_item_label(item_key)}`.")
         return
 
-    await event.reply(f"✅ Removed standalone UC calculator price for `{format_uc_calc_item_label(item_key)}`.")
+    await safe_uc_calc_reply(event, f"✅ Removed standalone UC calculator price for `{format_uc_calc_item_label(item_key)}`.")
 
 
 UC_PRICES_PATTERN = r'(?i)^/?ucprices$'
@@ -3356,7 +3399,8 @@ async def ucprices_command_handler(event):
 
     prices = list_uc_calc_prices()
     if not prices:
-        await event.reply(
+        await safe_uc_calc_reply(
+            event,
             "ℹ️ No standalone UC calculator prices are set yet.\n"
             "Use `/setucprice <uc_amount> <price>`."
         )
@@ -3365,7 +3409,7 @@ async def ucprices_command_handler(event):
     lines = ["🧮 **Standalone UC Calculator Prices**", ""]
     for item_key, item_label, price in prices:
         lines.append(f"• `{item_label}` = `{format_money_amount(price)}` BDT")
-    await event.reply("\n".join(lines))
+    await safe_uc_calc_reply(event, "\n".join(lines))
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?uccalc(?:\s+([\s\S]+))?$'))
@@ -3384,15 +3428,15 @@ async def uccalc_command_handler(event):
             target_text = ''
 
     if not target_text:
-        await event.reply("❌ Reply to the UC message or use `/uccalc <message text>`.")
+        await safe_uc_calc_reply(event, "❌ Reply to the UC message or use `/uccalc <message text>`.")
         return
 
     items = parse_uc_calc_items(target_text, supported_keys)
     if not items:
-        await event.reply("❌ Could not detect any UC quantity lines from that message.")
+        await safe_uc_calc_reply(event, "❌ Could not detect any UC quantity lines from that message.")
         return
 
-    await event.reply(build_uc_calc_response(items))
+    await safe_uc_calc_reply(event, build_uc_calc_response(items))
 
 
 async def uc_price_auto_reply_handler(event):
