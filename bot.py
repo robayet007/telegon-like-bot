@@ -474,6 +474,21 @@ def normalize_uc_calc_text(text: str) -> str:
     """Normalize decorated Telegram text so UC calculator parsing stays reliable."""
     normalized = unicodedata.normalize('NFKC', text or '')
     normalized = normalized.replace('\ufe0f', '').replace('\ufe0e', '')
+    normalized = normalized.translate(str.maketrans({
+        'ᴏ': 'o',
+        'ʀ': 'r',
+        'ᴛ': 't',
+        'ʜ': 'h',
+        'ғ': 'f',
+        'ᴜ': 'u',
+        'ᴅ': 'd',
+        'ᴄ': 'c',
+        'ᴘ': 'p',
+        'ѕ': 's',
+        'ᴡ': 'w',
+        'ᴍ': 'm',
+        'ʟ': 'l',
+    }))
     cleaned_chars = []
     for char in normalized:
         if unicodedata.category(char) == 'Mn':
@@ -521,6 +536,20 @@ def parse_uc_calc_items(message_text: str, supported_keys: set[str] | None = Non
     return items
 
 
+def has_uc_calc_worth_footer(message_text: str) -> bool:
+    """Return True when the message footer contains a Worth Of total line."""
+    non_empty_lines = [
+        line.strip().lower()
+        for line in normalize_uc_calc_text(message_text or '').splitlines()
+        if line.strip()
+    ]
+    for line in non_empty_lines[-3:]:
+        compact_line = re.sub(r'[^a-z0-9]+', '', line)
+        if compact_line.startswith('worthof') or ('worth' in compact_line and 'usdt' in compact_line):
+            return True
+    return False
+
+
 def build_uc_calc_response(items: list[dict]) -> str:
     """Build calculation summary using standalone UC calculator prices."""
     lines = ["🧮 **UC Calculation Result**", ""]
@@ -556,6 +585,9 @@ def build_uc_calc_response(items: list[dict]) -> str:
 def looks_like_uc_due_message(message_text: str, supported_keys: set[str] | None = None) -> bool:
     """Heuristic check for the styled UC due messages shared in private chat."""
     normalized = normalize_uc_calc_text(message_text or '').lower()
+    if has_uc_calc_worth_footer(message_text):
+        return False
+
     keys = {normalize_uc_calc_item_key(key) for key in (supported_keys or UC_CALC_DEFAULT_PACKAGE_KEYS)}
     parsed_items = parse_uc_calc_items(message_text, keys)
     non_empty_lines = [line.strip() for line in normalized.splitlines() if line.strip()]
@@ -3469,6 +3501,8 @@ async def uc_price_auto_reply_handler(event):
     supported_keys = {item_key for item_key, _, _ in list_uc_calc_prices()}.union(UC_CALC_DEFAULT_PACKAGE_KEYS)
     text = (event.raw_text or '').strip()
     if not text or text.startswith('/'):
+        return
+    if has_uc_calc_worth_footer(text):
         return
 
     normalized_source = normalize_identity_text(UC_CALC_SOURCE_USERNAME)
