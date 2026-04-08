@@ -8,6 +8,10 @@ import json
 import sqlite3
 import time
 import unicodedata
+from collections.abc import MutableMapping, MutableSequence, MutableSet
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation, getcontext
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,6 +52,10 @@ else:
 
 MAIN_CLIENT = client
 SUPER_ADMIN_CLIENTS = {}
+SUPER_ADMIN_BRANCH_STATES = {}
+SUPER_ADMIN_STATE_COLLECTIONS = {}
+SUPER_ADMIN_MONGO_CLIENTS = {}
+CLIENT_BRANCH_OWNER_IDS = {}
 RECENT_EVENT_KEYS = {}
 
 # =========================
@@ -61,46 +69,140 @@ DEFAULT_MONTHLY_LIMIT = 0
 
 # Supported like packages / APIs
 LIKE_TYPES = (100, 200)
-# Per-user custom limits: user_id -> {100: limit, 200: limit}
-USER_LIMITS = {}
-
-# Monthly usage: (user_id, month_str, like_type) -> count
-USER_USAGE = {}
-
-# Recent successful like activity for dashboard
-REQUEST_ACTIVITY = []
-
-# Cached user profile labels: user_id -> {username, name}
-USER_PROFILES = {}
-
-# Hierarchy ownership: child_user_id -> manager_user_id
-USER_MANAGERS = {}
-
-# Per-manager signup prefix: user_id -> single-character prefix
-MANAGER_PREFIXES = {}
-
-# Internal payment info: user_id -> {due, balance, due_limit}
-USER_FINANCE = {}
-
-# Branch UC stock: owner_user_id -> {category: [signed_token, ...]}
-UC_STOCK = {}
-
-# Branch UC rate list: owner_user_id -> {category: price}
-UC_RATES = {}
-
-# Extra admins promoted by the owner: user_id set
+# Super admin registry and assigned top-level limits live only in the owner DB.
 ADMIN_USERS = set()
-
-# Super admins can create admins inside their own branch
 SUPER_ADMIN_USERS = set()
-
-# Pending super admin verification: user_id -> invited_by_user_id
 PENDING_SUPER_ADMINS = {}
-
-# Verified super admin credentials kept in memory
 SUPER_ADMIN_CREDENTIALS = {}
+SUPER_ADMIN_LIMITS = {}
 STATE_LOCK = asyncio.Lock()
-TOPUP_ORDER_SEQ = 0
+
+MAIN_BRANCH_OWNER_ID = None
+CURRENT_BRANCH_OWNER_ID = ContextVar('current_branch_owner_id', default=None)
+
+
+@dataclass
+class BranchState:
+    """One isolated operational branch state."""
+
+    owner_user_id: int | None = None
+    user_limits: dict = field(default_factory=dict)
+    user_usage: dict = field(default_factory=dict)
+    request_activity: list = field(default_factory=list)
+    user_profiles: dict = field(default_factory=dict)
+    user_managers: dict = field(default_factory=dict)
+    manager_prefixes: dict = field(default_factory=dict)
+    user_finance: dict = field(default_factory=dict)
+    uc_stock: dict = field(default_factory=dict)
+    uc_rates: dict = field(default_factory=dict)
+    topup_order_seq: int = 0
+
+
+MAIN_BRANCH_STATE = BranchState()
+
+
+def get_branch_state(owner_user_id: int | None = None) -> BranchState:
+    """Return the isolated state for one branch owner."""
+    if owner_user_id is None or owner_user_id == MAIN_BRANCH_OWNER_ID:
+        return MAIN_BRANCH_STATE
+    return SUPER_ADMIN_BRANCH_STATES.setdefault(owner_user_id, BranchState(owner_user_id=owner_user_id))
+
+
+def get_current_branch_owner_id() -> int | None:
+    """Return the active branch owner id for this async task."""
+    owner_user_id = CURRENT_BRANCH_OWNER_ID.get()
+    if owner_user_id == MAIN_BRANCH_OWNER_ID:
+        return None
+    return owner_user_id
+
+
+def get_current_branch_state() -> BranchState:
+    """Return the isolated state currently bound to this async task."""
+    return get_branch_state(get_current_branch_owner_id())
+
+
+@contextmanager
+def branch_state_scope(owner_user_id: int | None):
+    """Temporarily bind async-local state access to one branch owner."""
+    normalized_owner_id = None if owner_user_id == MAIN_BRANCH_OWNER_ID else owner_user_id
+    token = CURRENT_BRANCH_OWNER_ID.set(normalized_owner_id)
+    try:
+        yield
+    finally:
+        CURRENT_BRANCH_OWNER_ID.reset(token)
+
+
+class BranchDictProxy(MutableMapping):
+    """Dictionary proxy backed by the currently active branch state."""
+
+    def __init__(self, attr_name: str):
+        self.attr_name = attr_name
+
+    def _store(self):
+        return getattr(get_current_branch_state(), self.attr_name)
+
+    def __getitem__(self, key):
+        return self._store()[key]
+
+    def __setitem__(self, key, value):
+        self._store()[key] = value
+
+    def __delitem__(self, key):
+        del self._store()[key]
+
+    def __iter__(self):
+        return iter(self._store())
+
+    def __len__(self):
+        return len(self._store())
+
+    def __getattr__(self, name):
+        return getattr(self._store(), name)
+
+    def __repr__(self):
+        return repr(self._store())
+
+
+class BranchListProxy(MutableSequence):
+    """List proxy backed by the currently active branch state."""
+
+    def __init__(self, attr_name: str):
+        self.attr_name = attr_name
+
+    def _store(self):
+        return getattr(get_current_branch_state(), self.attr_name)
+
+    def __getitem__(self, index):
+        return self._store()[index]
+
+    def __setitem__(self, index, value):
+        self._store()[index] = value
+
+    def __delitem__(self, index):
+        del self._store()[index]
+
+    def __len__(self):
+        return len(self._store())
+
+    def insert(self, index, value):
+        self._store().insert(index, value)
+
+    def __getattr__(self, name):
+        return getattr(self._store(), name)
+
+    def __repr__(self):
+        return repr(self._store())
+
+
+USER_LIMITS = BranchDictProxy('user_limits')
+USER_USAGE = BranchDictProxy('user_usage')
+REQUEST_ACTIVITY = BranchListProxy('request_activity')
+USER_PROFILES = BranchDictProxy('user_profiles')
+USER_MANAGERS = BranchDictProxy('user_managers')
+MANAGER_PREFIXES = BranchDictProxy('manager_prefixes')
+USER_FINANCE = BranchDictProxy('user_finance')
+UC_STOCK = BranchDictProxy('uc_stock')
+UC_RATES = BranchDictProxy('uc_rates')
 
 mongo_client = None
 mongo_db = None
@@ -171,8 +273,8 @@ UC_CALC_DEFAULT_PACKAGE_KEYS = {
 UC_CALC_COMMAND_PREFIXES = {
     'setucprice', 'delucprice', 'ucprices', 'uccalc',
     'like', 'start', 'help', 'mylimit', 'myaccess',
-    'setadmin', 'removeadmin', 'setsuperadmin', 'removesuperadmin',
-    'superauth', 'setsplimit', 'setlimit', 'resetlimit', 'alllimit',
+    'setsuperadmin', 'removesuperadmin',
+    'superauth', 'setlimit', 'resetlimit', 'alllimit',
     'setprefix',
 }
 
@@ -184,6 +286,10 @@ def _build_fernet(secret: str) -> Fernet:
 
 
 FERNET = _build_fernet(STOCK_TOKEN_SECRET)
+MAIN_METADATA_DOC_ID = 'main_metadata'
+MAIN_BRANCH_STATE_DOC_ID = 'owner_branch_state'
+BRANCH_STATE_DOC_ID = 'branch_state'
+LEGACY_GLOBAL_STATE_DOC_ID = 'global_state'
 
 
 class CalculatorError(Exception):
@@ -336,6 +442,357 @@ def init_mongodb():
         mongo_db = None
         state_collection = None
         print(f"⚠️ MongoDB connection failed: {e}")
+
+
+def get_state_collection_for_owner(owner_user_id: int | None = None):
+    """Return the Mongo collection responsible for one isolated branch."""
+    if owner_user_id is None or owner_user_id == MAIN_BRANCH_OWNER_ID:
+        return state_collection
+    return SUPER_ADMIN_STATE_COLLECTIONS.get(owner_user_id)
+
+
+def _get_database_for_client(target_client: MongoClient):
+    """Resolve default DB from URI, with env fallback when missing."""
+    try:
+        default_db = target_client.get_default_database()
+    except Exception:
+        default_db = None
+    return default_db or target_client[MONGODB_DB]
+
+
+def init_super_admin_storage(owner_user_id: int, mongodb_uri: str):
+    """Initialize a super admin's isolated Mongo collection handle."""
+    if not mongodb_uri:
+        raise ValueError("Missing MongoDB URI.")
+
+    existing_client = SUPER_ADMIN_MONGO_CLIENTS.get(owner_user_id)
+    if existing_client is not None:
+        try:
+            existing_client.close()
+        except Exception:
+            pass
+
+    target_client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=5000)
+    target_client.admin.command('ping')
+    target_db = _get_database_for_client(target_client)
+    SUPER_ADMIN_MONGO_CLIENTS[owner_user_id] = target_client
+    SUPER_ADMIN_STATE_COLLECTIONS[owner_user_id] = target_db[MONGODB_STATE_COLLECTION]
+
+
+def _collect_legacy_branch_descendants(user_managers: dict[int, int], root_user_id: int) -> set[int]:
+    """Collect one user's full subtree from the legacy shared hierarchy."""
+    descendants = set()
+    queue = [root_user_id]
+
+    while queue:
+        current_user_id = queue.pop(0)
+        if current_user_id in descendants:
+            continue
+        descendants.add(current_user_id)
+        queue.extend(
+            user_id
+            for user_id, manager_id in user_managers.items()
+            if manager_id == current_user_id
+        )
+
+    return descendants
+
+
+def _extract_legacy_owner_branch_state(legacy_data: dict) -> dict:
+    """Keep only owner-side data from the previous shared global state."""
+    legacy_user_managers = {
+        int(user_id): int(manager_id)
+        for user_id, manager_id in legacy_data.get('user_managers', {}).items()
+    }
+    legacy_super_admin_users = set(int(user_id) for user_id in legacy_data.get('super_admin_users', []))
+    excluded_ids = set()
+    for super_admin_user_id in legacy_super_admin_users:
+        excluded_ids.update(_collect_legacy_branch_descendants(legacy_user_managers, super_admin_user_id))
+
+    def keep_user(user_id_value) -> bool:
+        return int(user_id_value) not in excluded_ids
+
+    filtered_usage = []
+    for item in legacy_data.get('user_usage', []):
+        if keep_user(item.get('user_id', 0)):
+            filtered_usage.append(item)
+
+    filtered_activity = []
+    for item in legacy_data.get('request_activity', []):
+        actor_id = item.get('actor_id')
+        manager_id = item.get('manager_id')
+        if actor_id is not None and not keep_user(actor_id):
+            continue
+        if manager_id is not None and not keep_user(manager_id):
+            continue
+        filtered_activity.append(item)
+
+    return {
+        '_id': MAIN_BRANCH_STATE_DOC_ID,
+        'user_limits': {
+            str(user_id): limits
+            for user_id, limits in legacy_data.get('user_limits', {}).items()
+            if keep_user(user_id)
+        },
+        'user_managers': {
+            str(user_id): manager_id
+            for user_id, manager_id in legacy_data.get('user_managers', {}).items()
+            if keep_user(user_id) and keep_user(manager_id)
+        },
+        'manager_prefixes': {
+            str(user_id): prefix
+            for user_id, prefix in legacy_data.get('manager_prefixes', {}).items()
+            if keep_user(user_id)
+        },
+        'user_finance': {
+            str(user_id): finance_blob
+            for user_id, finance_blob in legacy_data.get('user_finance', {}).items()
+            if keep_user(user_id)
+        },
+        'uc_stock': {
+            str(owner_id): stock_blob
+            for owner_id, stock_blob in legacy_data.get('uc_stock', {}).items()
+            if keep_user(owner_id)
+        },
+        'uc_rates': {
+            str(owner_id): rate_blob
+            for owner_id, rate_blob in legacy_data.get('uc_rates', {}).items()
+            if keep_user(owner_id)
+        },
+        'topup_order_seq': legacy_data.get('topup_order_seq', 0),
+        'user_usage': filtered_usage,
+        'request_activity': filtered_activity,
+        'user_profiles': {
+            str(user_id): profile
+            for user_id, profile in legacy_data.get('user_profiles', {}).items()
+            if keep_user(user_id)
+        },
+    }
+
+
+def _load_branch_state_into(branch_state: BranchState, data: dict | None):
+    """Hydrate one branch state object from a Mongo document."""
+    if not data:
+        branch_state.user_limits = {}
+        branch_state.user_usage = {}
+        branch_state.request_activity = []
+        branch_state.user_profiles = {}
+        branch_state.user_managers = {}
+        branch_state.manager_prefixes = {}
+        branch_state.user_finance = {}
+        branch_state.uc_stock = {}
+        branch_state.uc_rates = {}
+        branch_state.topup_order_seq = 0
+        return
+
+    branch_state.user_limits = {
+        int(user_id): {int(k): int(v) for k, v in limits.items()}
+        for user_id, limits in data.get('user_limits', {}).items()
+    }
+    branch_state.user_usage = {
+        (int(item['user_id']), item['month'], int(item['like_type'])): int(item['count'])
+        for item in data.get('user_usage', [])
+    }
+    branch_state.request_activity = list(data.get('request_activity', []))
+    branch_state.user_profiles = {
+        int(user_id): profile
+        for user_id, profile in data.get('user_profiles', {}).items()
+    }
+    branch_state.user_managers = {
+        int(user_id): int(manager_id)
+        for user_id, manager_id in data.get('user_managers', {}).items()
+    }
+    branch_state.manager_prefixes = {
+        int(user_id): str(prefix)
+        for user_id, prefix in data.get('manager_prefixes', {}).items()
+        if str(prefix).strip()
+    }
+    branch_state.user_finance = {}
+    for user_id, finance_blob in data.get('user_finance', {}).items():
+        if isinstance(finance_blob, str):
+            finance = decrypt_payload_token(finance_blob, 'user-finance')
+            if finance is None:
+                continue
+        else:
+            finance = finance_blob
+
+        branch_state.user_finance[int(user_id)] = {
+            'due': str(finance.get('due', '0')),
+            'balance': str(finance.get('balance', '0')),
+            'due_limit': str(finance.get('due_limit', '0')),
+            'purchases': {
+                str(product): int(count)
+                for product, count in finance.get('purchases', {}).items()
+            },
+        }
+
+    branch_state.uc_stock = {}
+    for owner_id, stock_blob in data.get('uc_stock', {}).items():
+        if isinstance(stock_blob, str):
+            category_map = decrypt_payload_token(stock_blob, 'branch-stock')
+            if category_map is None:
+                continue
+        else:
+            category_map = stock_blob
+
+        branch_state.uc_stock[int(owner_id)] = {
+            str(category): list(tokens)
+            for category, tokens in category_map.items()
+        }
+
+    branch_state.uc_rates = {}
+    for owner_id, rate_blob in data.get('uc_rates', {}).items():
+        if isinstance(rate_blob, str):
+            category_map = decrypt_payload_token(rate_blob, 'branch-rates')
+            if category_map is None:
+                continue
+        else:
+            category_map = rate_blob
+
+        branch_state.uc_rates[int(owner_id)] = {
+            str(category): str(price)
+            for category, price in category_map.items()
+        }
+    branch_state.topup_order_seq = int(data.get('topup_order_seq', 0))
+
+
+def _build_branch_state_payload(branch_state: BranchState, document_id: str) -> dict:
+    """Serialize one branch state object for MongoDB."""
+    return {
+        '_id': document_id,
+        'user_limits': {
+            str(user_id): {str(k): v for k, v in limits.items()}
+            for user_id, limits in branch_state.user_limits.items()
+        },
+        'user_managers': {
+            str(user_id): manager_id
+            for user_id, manager_id in branch_state.user_managers.items()
+        },
+        'manager_prefixes': {
+            str(user_id): prefix
+            for user_id, prefix in branch_state.manager_prefixes.items()
+        },
+        'user_finance': {
+            str(user_id): encrypt_payload_token(finance, 'user-finance')
+            for user_id, finance in branch_state.user_finance.items()
+        },
+        'uc_stock': {
+            str(owner_id): encrypt_payload_token(category_map, 'branch-stock')
+            for owner_id, category_map in branch_state.uc_stock.items()
+        },
+        'uc_rates': {
+            str(owner_id): encrypt_payload_token(category_map, 'branch-rates')
+            for owner_id, category_map in branch_state.uc_rates.items()
+        },
+        'topup_order_seq': branch_state.topup_order_seq,
+        'user_usage': [
+            {
+                'user_id': user_id,
+                'month': month,
+                'like_type': like_type,
+                'count': count,
+            }
+            for (user_id, month, like_type), count in branch_state.user_usage.items()
+        ],
+        'request_activity': branch_state.request_activity[-200:],
+        'user_profiles': {
+            str(user_id): profile
+            for user_id, profile in branch_state.user_profiles.items()
+        },
+    }
+
+
+def load_main_metadata():
+    """Load owner-controlled super admin metadata from the main database."""
+    global SUPER_ADMIN_USERS, PENDING_SUPER_ADMINS, SUPER_ADMIN_CREDENTIALS, SUPER_ADMIN_LIMITS
+
+    if state_collection is None:
+        return
+
+    metadata = state_collection.find_one({'_id': MAIN_METADATA_DOC_ID})
+    legacy_data = None
+    if not metadata:
+        legacy_data = state_collection.find_one({'_id': LEGACY_GLOBAL_STATE_DOC_ID})
+        metadata = legacy_data or {}
+
+    SUPER_ADMIN_USERS = set(int(user_id) for user_id in metadata.get('super_admin_users', []))
+    PENDING_SUPER_ADMINS = {
+        int(user_id): int(invited_by)
+        for user_id, invited_by in metadata.get('pending_super_admins', {}).items()
+    }
+    SUPER_ADMIN_CREDENTIALS = {
+        int(user_id): creds
+        for user_id, creds in metadata.get('super_admin_credentials', {}).items()
+    }
+    SUPER_ADMIN_LIMITS = {
+        int(user_id): {int(k): int(v) for k, v in limits.items()}
+        for user_id, limits in metadata.get('super_admin_limits', {}).items()
+    }
+
+    if legacy_data and not metadata.get('super_admin_limits'):
+        legacy_limits = {
+            int(user_id): {int(k): int(v) for k, v in limits.items()}
+            for user_id, limits in legacy_data.get('user_limits', {}).items()
+        }
+        for super_admin_user_id in SUPER_ADMIN_USERS:
+            if super_admin_user_id in legacy_limits:
+                SUPER_ADMIN_LIMITS[super_admin_user_id] = legacy_limits[super_admin_user_id]
+
+    SUPER_ADMIN_USERS.update(SUPER_ADMIN_CREDENTIALS.keys())
+
+
+def save_main_metadata():
+    """Persist owner-only super admin metadata into the main database."""
+    if state_collection is None:
+        return
+
+    data = {
+        '_id': MAIN_METADATA_DOC_ID,
+        'super_admin_users': sorted(SUPER_ADMIN_USERS),
+        'pending_super_admins': {
+            str(user_id): invited_by
+            for user_id, invited_by in PENDING_SUPER_ADMINS.items()
+        },
+        'super_admin_credentials': {
+            str(user_id): creds
+            for user_id, creds in SUPER_ADMIN_CREDENTIALS.items()
+        },
+        'super_admin_limits': {
+            str(user_id): {str(k): v for k, v in limits.items()}
+            for user_id, limits in SUPER_ADMIN_LIMITS.items()
+        },
+    }
+    state_collection.replace_one({'_id': MAIN_METADATA_DOC_ID}, data, upsert=True)
+
+
+def load_branch_state(owner_user_id: int | None = None):
+    """Load one isolated branch state from MongoDB."""
+    branch_state = get_branch_state(owner_user_id)
+    collection = get_state_collection_for_owner(owner_user_id)
+    if collection is None:
+        _load_branch_state_into(branch_state, None)
+        return
+
+    document_id = MAIN_BRANCH_STATE_DOC_ID if owner_user_id is None else BRANCH_STATE_DOC_ID
+    data = collection.find_one({'_id': document_id})
+    if owner_user_id is None and not data:
+        legacy_data = collection.find_one({'_id': LEGACY_GLOBAL_STATE_DOC_ID})
+        if legacy_data:
+            data = _extract_legacy_owner_branch_state(legacy_data)
+
+    _load_branch_state_into(branch_state, data)
+
+
+def save_branch_state(owner_user_id: int | None = None):
+    """Persist one isolated branch state into its own Mongo collection."""
+    collection = get_state_collection_for_owner(owner_user_id)
+    if collection is None:
+        return
+
+    branch_state = get_branch_state(owner_user_id)
+    document_id = MAIN_BRANCH_STATE_DOC_ID if owner_user_id is None else BRANCH_STATE_DOC_ID
+    payload = _build_branch_state_payload(branch_state, document_id)
+    collection.replace_one({'_id': document_id}, payload, upsert=True)
 
 
 def init_uc_calc_db():
@@ -768,6 +1225,26 @@ def save_state():
         print(f"⚠️ Failed to save state: {e}")
 
 
+def load_state():
+    """Load main metadata plus the owner branch state."""
+    try:
+        load_main_metadata()
+        load_branch_state(None)
+    except Exception as e:
+        print(f"âš ï¸ Failed to load state: {e}")
+
+
+def save_state():
+    """Save only the active branch, plus owner metadata when relevant."""
+    try:
+        owner_user_id = get_current_branch_owner_id()
+        save_branch_state(owner_user_id)
+        if owner_user_id is None:
+            save_main_metadata()
+    except Exception as e:
+        print(f"âš ï¸ Failed to save state: {e}")
+
+
 async def save_state_locked():
     """Persist state while holding the shared async lock."""
     async with STATE_LOCK:
@@ -791,7 +1268,10 @@ def _usage_key(user_id: int, like_type: int) -> tuple:
 
 def get_user_limit(user_id: int, like_type: int) -> int:
     """Get a user's configured limit for a specific like type."""
-    limits = USER_LIMITS.get(user_id, {})
+    if user_id in SUPER_ADMIN_LIMITS:
+        limits = SUPER_ADMIN_LIMITS.get(user_id, {})
+    else:
+        limits = USER_LIMITS.get(user_id, {})
     return limits.get(like_type, DEFAULT_MONTHLY_LIMIT)
 
 
@@ -939,7 +1419,7 @@ def user_owns_exact_prefix(user_id: int, prefix_text: str) -> bool:
 
 def is_prefix_manager_account(user_id: int) -> bool:
     """Return True when a user owns a branch prefix or acts as a super-admin manager."""
-    return user_id in SUPER_ADMIN_USERS or bool(get_manager_prefix(user_id))
+    return user_id in SUPER_ADMIN_USERS or user_id == get_current_branch_state().owner_user_id or bool(get_manager_prefix(user_id))
 
 
 def is_registered_under_branch(prefix_owner_id: int, target_user_id: int) -> bool:
@@ -1345,6 +1825,7 @@ def get_cached_display_label(user_id: int) -> str | None:
 
 async def get_sender_identity(event):
     """Resolve sender id and username reliably."""
+    get_event_client(event)
     sender_id = event.sender_id
     sender_username = None
 
@@ -1357,7 +1838,9 @@ async def get_sender_identity(event):
     except Exception:
         pass
 
-    return sender_id, sender_username.lower() if sender_username else None
+    normalized_username = sender_username.lower() if sender_username else None
+    branch_actor_user_id = resolve_branch_actor_user_id(sender_id, normalized_username)
+    return branch_actor_user_id, normalized_username
 
 
 async def get_sender_display_name(event) -> str:
@@ -1383,7 +1866,9 @@ async def get_sender_display_name(event) -> str:
 
 def get_event_client(event):
     """Return the active Telegram client for this event."""
-    return getattr(event, 'client', MAIN_CLIENT)
+    event_client = getattr(event, 'client', MAIN_CLIENT)
+    bind_current_branch_for_client(event_client)
+    return event_client
 
 
 def should_skip_duplicate_event(event, handler_name: str) -> bool:
@@ -1412,6 +1897,20 @@ def get_client_for_branch_owner(owner_user_id: int | None):
     if owner_user_id is not None and owner_user_id in SUPER_ADMIN_CLIENTS:
         return SUPER_ADMIN_CLIENTS[owner_user_id]
     return MAIN_CLIENT
+
+
+def get_branch_owner_id_for_client(target_client) -> int | None:
+    """Resolve which isolated branch is bound to a Telegram client."""
+    if target_client == MAIN_CLIENT:
+        return None
+    return CLIENT_BRANCH_OWNER_IDS.get(id(target_client))
+
+
+def bind_current_branch_for_client(target_client) -> int | None:
+    """Bind branch-local state to the current async task for one client."""
+    owner_user_id = get_branch_owner_id_for_client(target_client)
+    CURRENT_BRANCH_OWNER_ID.set(owner_user_id)
+    return owner_user_id
 
 
 async def safe_event_reply(event, message: str, **kwargs):
@@ -1456,14 +1955,9 @@ def is_known_super_admin_identity(sender_id: int, sender_username: str | None) -
         verified_username = creds.get('verified_account_username')
 
         if sender_id is not None and verified_account_id == sender_id:
-            SUPER_ADMIN_USERS.add(stored_user_id)
-            SUPER_ADMIN_USERS.add(sender_id)
             return True
 
         if sender_username and verified_username and verified_username.lower() == sender_username:
-            if verified_account_id is not None:
-                SUPER_ADMIN_USERS.add(int(verified_account_id))
-            SUPER_ADMIN_USERS.add(stored_user_id)
             return True
 
     return False
@@ -1495,21 +1989,14 @@ async def is_owner(event) -> bool:
 
 
 async def is_super_admin(event) -> bool:
-    """Return True for owner or verified super admins."""
-    if await is_owner(event):
-        return True
-
+    """Return True only for verified super admins."""
     sender_id, sender_username = await get_sender_identity(event)
     return is_known_super_admin_identity(sender_id, sender_username)
 
 
 async def is_admin(event) -> bool:
-    """Return True for owner, super admins, or delegated admins."""
-    if await is_super_admin(event):
-        return True
-
-    sender_id, _ = await get_sender_identity(event)
-    return sender_id in ADMIN_USERS
+    """Return True for privileged branch managers: owner or super admin."""
+    return await is_owner(event) or await is_super_admin(event)
 
 
 async def get_access_role(event) -> str:
@@ -1518,8 +2005,6 @@ async def get_access_role(event) -> str:
         return "Owner"
     if await is_super_admin(event):
         return "Super Admin"
-    if await is_admin(event):
-        return "Admin"
     return "User"
 
 
@@ -1539,7 +2024,6 @@ async def should_ignore_privileged_incoming_private_command(event) -> bool:
     if event.is_private:
         return (
             sender_id == owner_id
-            or sender_id in ADMIN_USERS
             or is_known_super_admin_identity(sender_id, sender_username)
         )
 
@@ -1554,7 +2038,6 @@ async def should_ignore_privileged_incoming_private_command(event) -> bool:
 
     return (
         sender_id == owner_id
-        or sender_id in ADMIN_USERS
         or is_known_super_admin_identity(sender_id, sender_username)
     )
 
@@ -1565,44 +2048,40 @@ async def can_create_super_admin(event) -> bool:
 
 
 async def can_create_admin(event) -> bool:
-    """Owner and super admins can create normal admins."""
-    return await is_super_admin(event)
+    """Normal admin creation is disabled in the new model."""
+    return False
 
 
 async def can_use_signup_prefix(event) -> bool:
-    """Only owner and super admins can register users with a prefix command."""
-    return await is_super_admin(event)
+    """Only owner and super admins can register users inside their branch."""
+    return await is_admin(event)
 
 
 async def can_set_prefix(event) -> bool:
-    """Any admin-level account can save a branch prefix."""
+    """Only branch owners can save a branch prefix."""
     return await is_admin(event)
 
 
 async def can_manage_due_limit(event) -> bool:
-    """Owner, super admins, and admins can manage due limits in their branch."""
+    """Only owner and super admins can manage due limits in their branch."""
     return await is_admin(event)
 
 
 async def can_manage_target_user(event, target_user_id: int, allow_self: bool = False) -> bool:
     """Check whether the sender can manage the target based on hierarchy."""
-    actor_user_id, _ = await get_sender_identity(event)
+    actor_user_id, actor_username = await get_sender_identity(event)
+    actor_branch_user_id = resolve_branch_actor_user_id(actor_user_id, actor_username)
 
-    if allow_self and actor_user_id == target_user_id:
+    if allow_self and actor_branch_user_id == target_user_id:
         return True
 
-    if await is_owner(event):
-        return True
-
-    if await is_super_admin(event):
-        if target_user_id in SUPER_ADMIN_USERS:
-            return False
-        return is_managed_by(actor_user_id, target_user_id)
+    if target_user_id in SUPER_ADMIN_USERS:
+        return False
 
     if await is_admin(event):
-        if target_user_id in ADMIN_USERS or target_user_id in SUPER_ADMIN_USERS:
-            return False
-        return is_managed_by(actor_user_id, target_user_id)
+        if target_user_id == actor_branch_user_id:
+            return allow_self
+        return is_managed_by(actor_branch_user_id, target_user_id)
 
     return False
 
@@ -2188,9 +2667,9 @@ async def call_ucbot_topup_api(order_id: str, player_id: str, codes: list[str]) 
 
 def next_topup_order_id() -> str:
     """Allocate the next sequential topup order id."""
-    global TOPUP_ORDER_SEQ
-    TOPUP_ORDER_SEQ += 1
-    return str(TOPUP_ORDER_SEQ)
+    branch_state = get_current_branch_state()
+    branch_state.topup_order_seq += 1
+    return str(branch_state.topup_order_seq)
 
 
 async def topup_with_uc_codes(event, owner_user_id: int, target_user_id: int, uid: str, diamond_key: str, quantity: int):
@@ -2534,6 +3013,214 @@ async def set_limit_for_user(event, target_user_id: int, limit: int, like_type: 
     )
 
 
+async def start_super_admin_verification(event, target_user_id: int):
+    """Start an owner-only super admin invitation flow."""
+    owner_user_id, _ = await get_sender_identity(event)
+    if target_user_id == owner_user_id:
+        await event.reply("âŒ You cannot invite yourself as a super admin.")
+        return
+
+    if target_user_id in SUPER_ADMIN_USERS:
+        await event.reply(f"âŒ User `{target_user_id}` is already a super admin.")
+        return
+
+    PENDING_SUPER_ADMINS[target_user_id] = owner_user_id
+    SUPER_ADMIN_LIMITS.setdefault(target_user_id, {like_type: 0 for like_type in LIKE_TYPES})
+    save_state()
+    await event.reply(
+        f"âœ… Super admin request started for user `{target_user_id}`\n"
+        "Now that user must send:\n"
+        "`superauth <api_id> <api_hash> <session_string> <mongodb_url>`"
+    )
+
+
+async def approve_super_admin(event, api_id: int, api_hash: str, session_string: str, mongodb_uri: str):
+    """Verify a pending super admin and attach their isolated MongoDB."""
+    user_id, sender_username = await get_sender_identity(event)
+    if is_known_super_admin_identity(user_id, sender_username):
+        await event.reply("âœ… You are already a super admin.")
+        return
+
+    if user_id not in PENDING_SUPER_ADMINS:
+        await event.reply("âŒ No pending super admin request was found for you.")
+        return
+
+    ok, error_message, me = await validate_super_admin_credentials(api_id, api_hash, session_string)
+    if not ok:
+        await event.reply(f"âŒ Super admin verification failed.\nError: `{error_message}`")
+        return
+
+    try:
+        init_super_admin_storage(user_id, mongodb_uri)
+        with branch_state_scope(user_id):
+            branch_state = get_branch_state(user_id)
+            branch_state.owner_user_id = user_id
+            load_branch_state(user_id)
+            branch_state.owner_user_id = user_id
+    except Exception as e:
+        await event.reply(f"âŒ Super admin MongoDB connection failed.\nError: `{e}`")
+        return
+
+    SUPER_ADMIN_USERS.add(user_id)
+    SUPER_ADMIN_LIMITS.setdefault(user_id, {like_type: 0 for like_type in LIKE_TYPES})
+    SUPER_ADMIN_CREDENTIALS[user_id] = {
+        'api_id': api_id,
+        'api_hash': api_hash,
+        'session_string': session_string,
+        'mongodb_uri': mongodb_uri,
+        'verified_account_id': getattr(me, 'id', None),
+        'verified_account_username': getattr(me, 'username', None),
+    }
+    PENDING_SUPER_ADMINS.pop(user_id, None)
+    save_state()
+
+    verified_label = f"@{me.username}" if getattr(me, 'username', None) else str(getattr(me, 'id', 'N/A'))
+    await start_super_admin_clients()
+    await event.reply(
+        "âœ… Super admin verification successful.\n"
+        f"Verified account: `{verified_label}`\n"
+        "Your branch is now running from your own MongoDB."
+    )
+
+
+async def remove_super_admin_for_user(event, target_user_id: int):
+    """Remove a super admin without touching their isolated branch data."""
+    owner_user_id, _ = await get_sender_identity(event)
+    if target_user_id == owner_user_id:
+        await event.reply("âŒ You cannot remove the main owner.")
+        return
+
+    if (
+        target_user_id not in SUPER_ADMIN_USERS
+        and target_user_id not in SUPER_ADMIN_CREDENTIALS
+        and target_user_id not in PENDING_SUPER_ADMINS
+    ):
+        await event.reply(f"âŒ User `{target_user_id}` is not a super admin.")
+        return
+
+    super_client = SUPER_ADMIN_CLIENTS.pop(target_user_id, None)
+    if super_client is not None:
+        try:
+            await super_client.disconnect()
+        except Exception:
+            pass
+        CLIENT_BRANCH_OWNER_IDS.pop(id(super_client), None)
+
+    mongo_client_for_super = SUPER_ADMIN_MONGO_CLIENTS.pop(target_user_id, None)
+    if mongo_client_for_super is not None:
+        try:
+            mongo_client_for_super.close()
+        except Exception:
+            pass
+
+    SUPER_ADMIN_STATE_COLLECTIONS.pop(target_user_id, None)
+    SUPER_ADMIN_BRANCH_STATES.pop(target_user_id, None)
+    SUPER_ADMIN_USERS.discard(target_user_id)
+    SUPER_ADMIN_LIMITS.pop(target_user_id, None)
+    SUPER_ADMIN_CREDENTIALS.pop(target_user_id, None)
+    PENDING_SUPER_ADMINS.pop(target_user_id, None)
+    save_state()
+    await event.reply(
+        f"âœ… Super admin `{target_user_id}` removed.\n"
+        "Their isolated branch data was left untouched in their own MongoDB."
+    )
+
+
+async def check_limit(event, like_type: int) -> bool:
+    """Check whether the active sender still has quota this month."""
+    user_id, _ = await get_sender_identity(event)
+    key = _usage_key(user_id, like_type)
+
+    if await is_admin(event):
+        limit = get_available_self_usage_limit(user_id, like_type)
+    else:
+        limit = get_user_limit(user_id, like_type)
+
+    count = USER_USAGE.get(key, 0)
+    if count >= limit:
+        await event.reply(
+            f"âš ï¸ This month's limit is finished.\n\n"
+            f"ðŸ‘¤ User ID: `{user_id}`\n"
+            f"ðŸ“… Month: `{_this_month_str()}`\n"
+            f"ðŸŽ¯ Like Type: `{like_type}`\n"
+            f"ðŸ“Œ Monthly limit: `{limit}` request"
+        )
+        return False
+    return True
+
+
+async def set_limit_for_user(event, target_user_id: int, limit: int, like_type: int):
+    """Set owner-branch or superadmin-branch limits under the isolated model."""
+    actor_user_id, actor_username = await get_sender_identity(event)
+    actor_branch_user_id = resolve_branch_actor_user_id(actor_user_id, actor_username)
+    actor_is_owner = await is_owner(event)
+
+    if target_user_id in SUPER_ADMIN_USERS:
+        if not actor_is_owner:
+            await event.reply("âŒ Only the owner can set a super admin's limit.")
+            return
+
+        super_limits = SUPER_ADMIN_LIMITS.setdefault(target_user_id, {})
+        super_limits[like_type] = limit
+        save_state()
+        await event.reply(
+            f"âœ… Super admin limit set to `{limit}` for user `{target_user_id}`\n"
+            f"ðŸŽ¯ Like type: `{like_type}`\n"
+            "ðŸ“¤ This is one shared pool for both self use and distribution."
+        )
+        return
+
+    if actor_is_owner:
+        existing_manager_id = get_manager_id(target_user_id)
+        if target_user_id != actor_branch_user_id and existing_manager_id not in {None, actor_branch_user_id}:
+            await event.reply(
+                f"âŒ User `{target_user_id}` already belongs to manager `{existing_manager_id}`."
+            )
+            return
+        if target_user_id != actor_branch_user_id and existing_manager_id is None:
+            set_manager_for_user(target_user_id, actor_branch_user_id)
+    else:
+        if target_user_id == actor_branch_user_id:
+            await event.reply("âŒ You cannot set your own limit. The owner controls your top-level limit.")
+            return
+
+        if not await can_manage_target_user(event, target_user_id):
+            if get_manager_id(target_user_id) is not None:
+                await event.reply("âŒ You can only set limit for users inside your own branch.")
+                return
+
+        used_by_others = get_direct_child_limit_sum(actor_branch_user_id, like_type, exclude_user_id=target_user_id)
+        parent_limit = get_user_limit(actor_branch_user_id, like_type)
+        parent_used = get_user_used_count(actor_branch_user_id, like_type)
+        if used_by_others + parent_used + limit > parent_limit:
+            remaining = max(parent_limit - used_by_others - parent_used, 0)
+            await event.reply(
+                f"âŒ Not enough distributable limit.\n"
+                f"ðŸŽ¯ Like type: `{like_type}`\n"
+                f"ðŸ“Œ Your total limit: `{parent_limit}`\n"
+                f"ðŸ”„ Remaining distributable: `{remaining}`"
+            )
+            return
+
+        existing_manager_id = get_manager_id(target_user_id)
+        if existing_manager_id is not None and existing_manager_id != actor_branch_user_id:
+            await event.reply(
+                f"âŒ User `{target_user_id}` already belongs to manager `{existing_manager_id}`."
+            )
+            return
+
+        if existing_manager_id is None:
+            set_manager_for_user(target_user_id, actor_branch_user_id)
+
+    user_limits = USER_LIMITS.setdefault(target_user_id, {})
+    user_limits[like_type] = limit
+    save_state()
+    await event.reply(
+        f"âœ… Monthly limit set to `{limit}` for user `{target_user_id}`\n"
+        f"ðŸŽ¯ Like type: `{like_type}`"
+    )
+
+
 def format_response(data):
     """Format API response into a readable message"""
     likes_given = data.get('LikesGivenByAPI', 0)
@@ -2607,6 +3294,40 @@ async def call_ff_api(uid, like_type: int):
             'error': True,
             'message': f'Error calling API: {str(e)}'
         }
+
+
+async def register_user_under_manager(event, target_user_id: int):
+    """Attach a regular user to the current branch, excluding super admins."""
+    actor_user_id, _ = await get_sender_identity(event)
+
+    if target_user_id == actor_user_id:
+        await event.reply("âŒ You cannot register yourself with signup.")
+        return
+
+    if target_user_id in SUPER_ADMIN_USERS:
+        await event.reply("âŒ Super admins stay isolated and cannot be signed up into another branch.")
+        return
+
+    existing_manager_id = get_manager_id(target_user_id)
+    if existing_manager_id == actor_user_id:
+        await event.reply(f"â„¹ï¸ User `{target_user_id}` is already registered under your branch.")
+        return
+
+    if existing_manager_id is not None and existing_manager_id != actor_user_id:
+        await event.reply(
+            f"âŒ User `{target_user_id}` already belongs to manager `{existing_manager_id}`."
+        )
+        return
+
+    async with STATE_LOCK:
+        set_manager_for_user(target_user_id, actor_user_id)
+        ensure_user_finance_record(target_user_id)
+        save_state()
+    await event.reply(
+        "âœ… Signup successful.\n\n"
+        f"ðŸ†” User ID: `{target_user_id}`\n"
+        f"ðŸ‘¤ Manager ID: `{actor_user_id}`"
+    )
 
 
 LIKE_PATTERN = r'(?i)^/?like\s+(\d+)\s+(100|200)$'
@@ -2739,6 +3460,44 @@ async def help_command_handler(event):
     is_group = not event.is_private
     
     can_manage = await is_admin(event)
+
+    if can_manage:
+        manager_help = """ðŸ“– **Help**
+
+`like <uid> <100|200>`
+`start`
+`help`
+`mylimit`
+
+**Branch Commands**
+`setprefix <letter>`
+`Xsignup`
+`Xsignout`
+`Xduelimit <amount>`
+`Xbalance`
+`Xbalance <amount>`
+`Xstock`
+`Xstockadd <codes>`
+`Xrate`
+`Xdue`
+`Xdue <category> [qty]`
+`Xclear`
+`Xtp <uid> <diamond> [qty]`
+`X20 <price>` ... `X2000 <price>`
+
+**Owner / Superadmin Commands**
+`setsuperadmin @username`
+`superauth <api_id> <api_hash> <session_string> <mongodb_url>`
+`setlimit <n> <100|200>`
+`setlimit <n> @username <100|200>`
+`removesuperadmin @username`
+`resetlimit`
+`resetlimit @username`
+`alllimit`
+
+`setadmin`, `removeadmin`, and `setsplimit` are removed."""
+        await safe_event_reply(event, manager_help)
+        return
 
     # ---------- User Commands ----------
     if is_group:
@@ -2889,6 +3648,8 @@ async def setadmin_command_handler(event):
     Usage:
       /setadmin @username
     """
+    await event.reply("âŒ `setadmin` is removed in the new system.")
+    return
     await log_access_check(event, "setadmin")
     if not await can_create_admin(event):
         await event.reply(await build_access_denied_message(event, "Super Admin", "setadmin"))
@@ -2922,6 +3683,8 @@ async def removeadmin_command_handler(event):
     Usage:
       /removeadmin @username
     """
+    await event.reply("âŒ `removeadmin` is removed in the new system.")
+    return
     await log_access_check(event, "removeadmin")
     if not await can_create_admin(event):
         await event.reply(await build_access_denied_message(event, "Super Admin", "removeadmin"))
@@ -3014,7 +3777,7 @@ async def setsuperadmin_command_handler(event):
     await start_super_admin_verification(event, target_user_id)
 
 
-SUPERAUTH_PATTERN = r'(?i)^/?superauth\s+(\d+)\s+([A-Za-z0-9]+)\s+(.+)$'
+SUPERAUTH_PATTERN = r'(?i)^/?superauth\s+(\d+)\s+([A-Za-z0-9]+)\s+(\S+)\s+(\S+)$'
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=SUPERAUTH_PATTERN))
@@ -3022,7 +3785,7 @@ async def superauth_command_handler(event):
     """
     Submit credentials for pending super admin verification.
     Usage:
-      /superauth <api_id> <api_hash> <session_string>
+      /superauth <api_id> <api_hash> <session_string> <mongodb_url>
     """
     if await should_ignore_privileged_incoming_private_command(event):
         return
@@ -3034,17 +3797,18 @@ async def superauth_command_handler(event):
     if not match:
         await event.reply(
             "❌ Invalid format.\n"
-            "Usage: `/superauth <api_id> <api_hash> <session_string>`"
+            "Usage: `/superauth <api_id> <api_hash> <session_string> <mongodb_url>`"
         )
         return
 
     api_id = int(match.group(1))
     api_hash = match.group(2)
     session_string = match.group(3).strip()
+    mongodb_uri = match.group(4).strip()
 
     processing_msg = await event.reply("⏳ Verifying super admin credentials...")
     try:
-        await approve_super_admin(event, api_id, api_hash, session_string)
+        await approve_super_admin(event, api_id, api_hash, session_string, mongodb_uri)
         await processing_msg.delete()
     except Exception as e:
         try:
@@ -3104,6 +3868,8 @@ async def setsplimit_command_handler(event):
     Usage:
       /setsplimit 1000 @username 100
     """
+    await event.reply("âŒ `setsplimit` is removed. Use `setlimit <n> @username <100|200>` for super admins.")
+    return
     await log_access_check(event, "setsplimit")
     if not await is_owner(event):
         await event.reply(await build_access_denied_message(event, "Owner", "setsplimit"))
@@ -4211,6 +4977,214 @@ async def main():
     print("Press Ctrl+C to stop.")
 
     # Keep the bot running
+    disconnect_tasks = [MAIN_CLIENT.run_until_disconnected()]
+    disconnect_tasks.extend(
+        super_client.run_until_disconnected()
+        for super_client in SUPER_ADMIN_CLIENTS.values()
+    )
+    await asyncio.gather(*disconnect_tasks)
+
+
+async def start_super_admin_clients():
+    """Start dedicated Telegram clients backed by each super admin's own MongoDB."""
+    for user_id, creds in SUPER_ADMIN_CREDENTIALS.items():
+        api_id = creds.get('api_id')
+        api_hash = creds.get('api_hash')
+        session_string = creds.get('session_string')
+        mongodb_uri = creds.get('mongodb_uri')
+
+        if not api_id or not api_hash or not session_string or not mongodb_uri:
+            print(f"âš ï¸ Skipping super admin {user_id}: incomplete credentials or MongoDB URI")
+            continue
+
+        if user_id in SUPER_ADMIN_CLIENTS:
+            continue
+
+        try:
+            init_super_admin_storage(user_id, mongodb_uri)
+            with branch_state_scope(user_id):
+                branch_state = get_branch_state(user_id)
+                branch_state.owner_user_id = user_id
+                load_branch_state(user_id)
+                branch_state.owner_user_id = user_id
+
+            super_client = TelegramClient(StringSession(session_string), int(api_id), api_hash)
+            register_handlers(super_client)
+            await super_client.start()
+
+            me = await super_client.get_me()
+            SUPER_ADMIN_CLIENTS[user_id] = super_client
+            CLIENT_BRANCH_OWNER_IDS[id(super_client)] = user_id
+            print(
+                f"âœ… Super admin client started: user_id={user_id} "
+                f"account_id={getattr(me, 'id', 'N/A')} "
+                f"username={getattr(me, 'username', 'N/A')}"
+            )
+        except Exception as e:
+            print(f"âš ï¸ Failed to start super admin client for {user_id}: {e}")
+
+
+async def build_dashboard_payload() -> dict:
+    """Build an owner-safe dashboard payload without superadmin branch internals."""
+    me = await MAIN_CLIENT.get_me()
+    owner_id = me.id
+    month = _this_month_str()
+
+    with branch_state_scope(None):
+        known_user_ids = set(USER_LIMITS.keys())
+        known_user_ids.update(USER_MANAGERS.keys())
+        known_user_ids.update(USER_MANAGERS.values())
+        known_user_ids.add(owner_id)
+        for item in REQUEST_ACTIVITY:
+            actor_id = item.get('actor_id')
+            manager_id = item.get('manager_id')
+            if actor_id is not None:
+                known_user_ids.add(int(actor_id))
+            if manager_id is not None:
+                known_user_ids.add(int(manager_id))
+
+        labels = {}
+        for user_id in known_user_ids.union(SUPER_ADMIN_USERS):
+            labels[user_id] = await resolve_user_label(user_id)
+
+        def build_usage(user_id: int, like_type: int) -> int:
+            return USER_USAGE.get((user_id, month, like_type), 0)
+
+        recent_activity = []
+        for item in reversed(REQUEST_ACTIVITY[-50:]):
+            actor_id = item.get('actor_id')
+            manager_id = item.get('manager_id')
+            actor_label = labels.get(actor_id, {'name': str(actor_id), 'username': ''})
+            manager_label = labels.get(manager_id, {'name': 'Main Admin'}) if manager_id is not None else {'name': 'Main Admin'}
+            recent_activity.append({
+                'at': item.get('at', ''),
+                'actor': item.get('actor_name') or actor_label.get('name', str(actor_id)),
+                'actorRole': item.get('actor_role') or ('Main Admin' if actor_id == owner_id else 'User'),
+                'manager': manager_label.get('name', 'Main Admin'),
+                'uid': item.get('uid', ''),
+                'packageType': item.get('packageType', 0),
+                'likesAdded': item.get('likesAdded', 0),
+            })
+
+        owner_users = [
+            user_id for user_id in known_user_ids
+            if user_id != owner_id and user_id not in SUPER_ADMIN_USERS
+        ]
+
+    super_admin_cards = []
+    for user_id in sorted(SUPER_ADMIN_USERS):
+        label = labels.get(user_id) or await resolve_user_label(user_id)
+        super_admin_cards.append({
+            'id': user_id,
+            'username': label.get('username', ''),
+            'name': label.get('name', str(user_id)),
+            'limit100': get_user_limit(user_id, 100),
+            'used100': 0,
+            'distributed100': 0,
+            'limit200': get_user_limit(user_id, 200),
+            'used200': 0,
+            'distributed200': 0,
+            'admins': [],
+            'directUsers': [],
+        })
+
+    return {
+        'generatedAt': _utc_timestamp_str(),
+        'month': month,
+        'summary': {
+            'totalSuperAdmins': len(SUPER_ADMIN_USERS),
+            'totalAdmins': 0,
+            'totalUsers': len(owner_users),
+            'totalUidRequests': len(recent_activity),
+            'totalDistributed100': sum(item['limit100'] for item in super_admin_cards),
+            'totalDistributed200': sum(item['limit200'] for item in super_admin_cards),
+        },
+        'superAdmins': super_admin_cards,
+        'recentActivity': recent_activity,
+    }
+
+
+async def main():
+    """Main function to start the bot and the built-in dashboard web server."""
+    global MAIN_BRANCH_OWNER_ID
+
+    print("ðŸš€ Starting Free Fire Like Bot...")
+    init_uc_calc_db()
+    init_mongodb()
+    load_state()
+
+    await MAIN_CLIENT.start()
+
+    if not SESSION_STRING:
+        if not await MAIN_CLIENT.is_user_authorized():
+            print("ðŸ“± Please authorize this session:")
+            phone = input("Enter your phone number: ")
+            await MAIN_CLIENT.send_code_request(phone)
+
+            try:
+                code = input("Enter the code you received: ")
+                await MAIN_CLIENT.sign_in(phone, code)
+            except SessionPasswordNeededError:
+                password = input("Enter your 2FA password: ")
+                await MAIN_CLIENT.sign_in(password=password)
+
+    owner = await MAIN_CLIENT.get_me()
+    MAIN_BRANCH_OWNER_ID = owner.id
+    MAIN_BRANCH_STATE.owner_user_id = owner.id
+    CLIENT_BRANCH_OWNER_IDS[id(MAIN_CLIENT)] = None
+
+    print(
+        f"ðŸ“¦ Loaded owner branch with {len(get_direct_children(owner.id))} managed user(s) "
+        f"and {len(SUPER_ADMIN_USERS)} super admin(s)"
+    )
+
+    await start_super_admin_clients()
+
+    async def health(request):
+        return web.Response(text="OK")
+
+    async def dashboard_index(request):
+        index_path = DASHBOARD_DIR / "index.html"
+        if not index_path.exists():
+            return web.Response(
+                text="Dashboard file not found. Expected index.html in project root.",
+                status=404,
+            )
+        return web.FileResponse(index_path)
+
+    async def dashboard_asset(request):
+        allowed_files = {"style.css", "app.js"}
+        filename = request.match_info["filename"]
+        if filename not in allowed_files:
+            raise web.HTTPNotFound(text="Asset not found.")
+
+        asset_path = DASHBOARD_DIR / filename
+        if not asset_path.exists():
+            raise web.HTTPNotFound(text=f"Missing asset: {filename}")
+
+        return web.FileResponse(asset_path)
+
+    async def dashboard_api(request):
+        payload = await build_dashboard_payload()
+        return web.json_response(payload)
+
+    app = web.Application()
+    app.router.add_get("/", dashboard_index)
+    app.router.add_get(r"/{filename:style\.css|app\.js}", dashboard_asset)
+    app.router.add_get("/api/dashboard", dashboard_api)
+    app.router.add_get("/health", health)
+
+    port = int(os.getenv("PORT", 8000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    print(f"ðŸŒ HTTP server running on port {port}")
+    print(f"ðŸ–¥ Dashboard: http://127.0.0.1:{port}/")
+    print("âœ… Bot is running! Send /start to begin.")
+    print("Press Ctrl+C to stop.")
+
     disconnect_tasks = [MAIN_CLIENT.run_until_disconnected()]
     disconnect_tasks.extend(
         super_client.run_until_disconnected()
