@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation, getcontext
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 from pymongo import MongoClient
@@ -75,6 +75,7 @@ SUPER_ADMIN_USERS = set()
 PENDING_SUPER_ADMINS = {}
 SUPER_ADMIN_CREDENTIALS = {}
 SUPER_ADMIN_LIMITS = {}
+SUPER_ADMIN_ACCESS = {}
 STATE_LOCK = asyncio.Lock()
 
 MAIN_BRANCH_OWNER_ID = None
@@ -274,7 +275,7 @@ UC_CALC_COMMAND_PREFIXES = {
     'setucprice', 'delucprice', 'ucprices', 'uccalc',
     'like', 'start', 'help', 'mylimit', 'myaccess',
     'setsuperadmin', 'removesuperadmin',
-    'superauth', 'setlimit', 'resetlimit', 'alllimit',
+    'superauth', 'grant', 'grantlist', 'setlimit', 'resetlimit', 'alllimit',
     'setprefix',
 }
 
@@ -730,7 +731,7 @@ def _build_branch_state_payload(branch_state: BranchState, document_id: str) -> 
 
 def load_main_metadata():
     """Load owner-controlled super admin metadata from the main database."""
-    global SUPER_ADMIN_USERS, PENDING_SUPER_ADMINS, SUPER_ADMIN_CREDENTIALS, SUPER_ADMIN_LIMITS
+    global SUPER_ADMIN_USERS, PENDING_SUPER_ADMINS, SUPER_ADMIN_CREDENTIALS, SUPER_ADMIN_LIMITS, SUPER_ADMIN_ACCESS
 
     if state_collection is None:
         return
@@ -753,6 +754,11 @@ def load_main_metadata():
     SUPER_ADMIN_LIMITS = {
         int(user_id): {int(k): int(v) for k, v in limits.items()}
         for user_id, limits in metadata.get('super_admin_limits', {}).items()
+    }
+    SUPER_ADMIN_ACCESS = {
+        int(user_id): access
+        for user_id, access in metadata.get('super_admin_access', {}).items()
+        if isinstance(access, dict)
     }
 
     if legacy_data and not metadata.get('super_admin_limits'):
@@ -786,6 +792,11 @@ def save_main_metadata():
         'super_admin_limits': {
             str(user_id): {str(k): v for k, v in limits.items()}
             for user_id, limits in SUPER_ADMIN_LIMITS.items()
+        },
+        'super_admin_access': {
+            str(user_id): access
+            for user_id, access in SUPER_ADMIN_ACCESS.items()
+            if isinstance(access, dict)
         },
     }
     state_collection.replace_one({'_id': MAIN_METADATA_DOC_ID}, data, upsert=True)
@@ -1319,6 +1330,142 @@ def set_manager_for_user(target_user_id: int, manager_user_id: int | None):
         USER_MANAGERS.pop(target_user_id, None)
     else:
         USER_MANAGERS[target_user_id] = manager_user_id
+
+
+def _utc_now() -> datetime:
+    """Return the current UTC time as a timezone-aware datetime."""
+    return datetime.now(timezone.utc)
+
+
+def _parse_utc_datetime(value) -> datetime | None:
+    """Parse an ISO datetime string into UTC, if possible."""
+    if not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_utc_datetime(value: datetime | None) -> str:
+    """Render an aware datetime in a compact UTC format."""
+    if value is None:
+        return 'N/A'
+    return value.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+
+
+def get_super_admin_label(user_id: int) -> str:
+    """Return a readable label for a super admin account."""
+    label = get_cached_display_label(user_id)
+    if label:
+        return label
+
+    creds = SUPER_ADMIN_CREDENTIALS.get(user_id, {})
+    verified_username = creds.get('verified_account_username')
+    if verified_username:
+        return f"@{verified_username}"
+
+    return str(user_id)
+
+
+def get_super_admin_branch_owner_id(user_id: int | None) -> int | None:
+    """Return the nearest super admin in a user's manager chain."""
+    current_user_id = user_id
+    visited = set()
+
+    while current_user_id is not None and current_user_id not in visited:
+        if current_user_id in SUPER_ADMIN_USERS:
+            return current_user_id
+        visited.add(current_user_id)
+        current_user_id = get_manager_id(current_user_id)
+
+    return None
+
+
+def get_super_admin_access_record(user_id: int) -> dict:
+    """Return a normalized access record for one super admin."""
+    record = SUPER_ADMIN_ACCESS.get(user_id, {})
+    return record if isinstance(record, dict) else {}
+
+
+def get_super_admin_access_status(user_id: int) -> tuple[str, datetime | None]:
+    """Return access status plus the stored expiry for a super admin."""
+    expires_at = _parse_utc_datetime(get_super_admin_access_record(user_id).get('expires_at'))
+    if expires_at is None:
+        return 'missing', None
+    if expires_at > _utc_now():
+        return 'active', expires_at
+    return 'expired', expires_at
+
+
+def has_active_super_admin_access(user_id: int) -> bool:
+    """Return True when the super admin has an unexpired owner grant."""
+    status, _ = get_super_admin_access_status(user_id)
+    return status == 'active'
+
+
+def describe_branch_access_for_user(user_id: int | None) -> tuple[int | None, str]:
+    """Describe whether a user's branch system is active or blocked."""
+    super_admin_user_id = get_super_admin_branch_owner_id(user_id)
+    if super_admin_user_id is None:
+        return None, "Owner branch"
+
+    status, expires_at = get_super_admin_access_status(super_admin_user_id)
+    if status == 'active':
+        return super_admin_user_id, f"Active until {_format_utc_datetime(expires_at)}"
+    if status == 'expired':
+        return super_admin_user_id, f"Expired on {_format_utc_datetime(expires_at)}"
+    return super_admin_user_id, "Inactive - owner grant missing"
+
+
+def build_super_admin_access_denied_message(super_admin_user_id: int, command_name: str) -> str:
+    """Explain why a branch command is blocked for an inactive super admin branch."""
+    status, expires_at = get_super_admin_access_status(super_admin_user_id)
+    status_text = "No active grant"
+    date_line = ""
+
+    if status == 'expired':
+        status_text = "Expired"
+        date_line = f"\nExpired At: `{_format_utc_datetime(expires_at)}`"
+    elif status == 'active':
+        status_text = "Active"
+        date_line = f"\nExpires At: `{_format_utc_datetime(expires_at)}`"
+
+    super_admin_label = get_super_admin_label(super_admin_user_id)
+    grant_target = super_admin_label if super_admin_label.startswith('@') else str(super_admin_user_id)
+    return (
+        f"❌ `{command_name}` is off for this super admin branch.\n\n"
+        f"Super Admin: `{super_admin_label}`\n"
+        f"Status: `{status_text}`{date_line}\n\n"
+        f"Owner must run: `grant {grant_target} 30`"
+    )
+
+
+def build_super_admin_access_summary(user_id: int) -> str:
+    """Build one owner-facing grant status line for a super admin."""
+    status, expires_at = get_super_admin_access_status(user_id)
+    label = get_super_admin_label(user_id)
+
+    if status == 'active' and expires_at is not None:
+        seconds_left = max((expires_at - _utc_now()).total_seconds(), 0)
+        days_left = max(1, int((seconds_left + 86399) // 86400))
+        return (
+            f"• `{label}` | ID `{user_id}` | `ACTIVE` | "
+            f"`{days_left}` day(s) left | expires `{_format_utc_datetime(expires_at)}`"
+        )
+
+    if status == 'expired' and expires_at is not None:
+        return (
+            f"• `{label}` | ID `{user_id}` | `OFF` | "
+            f"expired `{_format_utc_datetime(expires_at)}`"
+        )
+
+    return f"• `{label}` | ID `{user_id}` | `OFF` | no grant set"
 
 
 def get_manager_prefix(user_id: int) -> str | None:
@@ -2027,6 +2174,12 @@ def is_known_super_admin_identity(sender_id: int, sender_username: str | None) -
     return False
 
 
+async def has_super_admin_identity(event) -> bool:
+    """Return True when the sender is a verified super admin, even if inactive."""
+    sender_id, _ = await get_sender_identity(event)
+    return sender_id in SUPER_ADMIN_USERS or sender_id in SUPER_ADMIN_CREDENTIALS
+
+
 def resolve_branch_actor_user_id(sender_id: int | None, sender_username: str | None) -> int | None:
     """Map a verified super-admin identity back to its stored branch owner id."""
     if sender_id is not None and sender_id in SUPER_ADMIN_CREDENTIALS:
@@ -2053,9 +2206,9 @@ async def is_owner(event) -> bool:
 
 
 async def is_super_admin(event) -> bool:
-    """Return True only for verified super admins."""
-    sender_id, sender_username = await get_sender_identity(event)
-    return is_known_super_admin_identity(sender_id, sender_username)
+    """Return True only for verified super admins with active owner grant."""
+    sender_id, _ = await get_sender_identity(event)
+    return sender_id in SUPER_ADMIN_USERS and has_active_super_admin_access(sender_id)
 
 
 async def is_admin(event) -> bool:
@@ -2069,7 +2222,20 @@ async def get_access_role(event) -> str:
         return "Owner"
     if await is_super_admin(event):
         return "Super Admin"
+    if await has_super_admin_identity(event):
+        return "Super Admin (Inactive)"
     return "User"
+
+
+async def ensure_branch_system_access(event, command_name: str, branch_owner_id: int | None = None) -> bool:
+    """Block branch operations when their super admin has no active owner grant."""
+    actor_user_id, _ = await get_sender_identity(event)
+    super_admin_user_id = branch_owner_id or get_super_admin_branch_owner_id(actor_user_id)
+    if super_admin_user_id is None or has_active_super_admin_access(super_admin_user_id):
+        return True
+
+    await event.reply(build_super_admin_access_denied_message(super_admin_user_id, command_name))
+    return False
 
 
 async def should_ignore_privileged_incoming_private_command(event) -> bool:
@@ -2507,9 +2673,15 @@ async def send_prefix_help_card(event, prefix: str, prefix_owner_id: int, sender
 async def send_prefixed_access_card(event, prefix: str, prefix_owner_id: int, sender_id: int, sender_username: str | None):
     """Show access details for the current user inside a resolved prefix branch."""
     branch_actor_user_id = resolve_branch_actor_user_id(sender_id, sender_username)
+    branch_access_owner_id, branch_access_text = describe_branch_access_for_user(branch_actor_user_id)
 
     if sender_id == prefix_owner_id:
-        role = "Owner" if await is_owner(event) else "Super Admin"
+        if await is_owner(event):
+            role = "Owner"
+        elif await is_super_admin(event):
+            role = "Super Admin"
+        else:
+            role = "Super Admin (Inactive)"
     elif branch_actor_user_id in ADMIN_USERS and branch_actor_user_id not in SUPER_ADMIN_USERS and get_manager_id(branch_actor_user_id) == prefix_owner_id:
         role = "Admin"
     elif is_registered_under_branch(prefix_owner_id, int(branch_actor_user_id)):
@@ -2527,6 +2699,8 @@ async def send_prefixed_access_card(event, prefix: str, prefix_owner_id: int, se
         f"👤 Branch ID: `{branch_actor_user_id or 'N/A'}`\n"
         f"👤 Manager ID: `{get_manager_id(branch_actor_user_id) or 'N/A'}`\n"
         f"👤 Prefix Owner: `{prefix_owner_id}`\n"
+        f"👤 Super Admin Branch: `{branch_access_owner_id or 'N/A'}`\n"
+        f"⚙️ Branch Access: `{branch_access_text}`\n"
         f"🔑 Prefix: `{prefix}`"
     )
 
@@ -2872,7 +3046,7 @@ async def topup_with_uc_codes(event, owner_user_id: int, target_user_id: int, ui
 async def purchase_uc_with_due(event, owner_user_id: int, target_user_id: int, category: str, quantity: int):
     """Sell UC stock using balance first, then due limit for the remainder."""
     if quantity <= 0:
-        await reply_via_branch_owner(event, owner_user_id, "âŒ Quantity must be at least 1.")
+        await reply_via_branch_owner(event, owner_user_id, "❌ Quantity must be at least 1.")
         return
 
     async with STATE_LOCK:
@@ -2883,16 +3057,16 @@ async def purchase_uc_with_due(event, owner_user_id: int, target_user_id: int, c
             await reply_via_branch_owner(
                 event,
                 owner_user_id,
-                f"âŒ Not enough stock.\n"
-                f"âžª Category : {category} UC\n"
-                f"âžª Need     : {quantity}\n"
-                f"âžª Stock    : {available_stock}"
+                f"❌ Not enough stock.\n"
+                f"- Category : {category} UC\n"
+                f"- Need     : {quantity}\n"
+                f"- Stock    : {available_stock}"
             )
             return
 
         unit_price = get_branch_rate(owner_user_id, category)
         if unit_price <= 0:
-            await reply_via_branch_owner(event, owner_user_id, f"âŒ Rate for `{category} UC` is not set.")
+            await reply_via_branch_owner(event, owner_user_id, f"❌ Rate for `{category} UC` is not set.")
             return
 
         total_price = unit_price * Decimal(quantity)
@@ -2902,18 +3076,18 @@ async def purchase_uc_with_due(event, owner_user_id: int, target_user_id: int, c
             await reply_via_branch_owner(
                 event,
                 owner_user_id,
-                "âŒ Not enough balance / due limit.\n"
-                f"âžª Total Price : {format_money_amount(total_price)} Tk\n"
-                f"âžª Balance     : {format_money_amount(charge_plan['balance_before'])} Tk\n"
-                f"âžª Current Due : {format_money_amount(charge_plan['due_before'])} Tk\n"
-                f"âžª Due Limit   : {format_money_amount(charge_plan['due_limit'])} Tk\n"
-                f"âžª Need More   : {format_money_amount(charge_plan['shortage'])} Tk"
+                "❌ Not enough balance / due limit.\n"
+                f"- Total Price : {format_money_amount(total_price)} Tk\n"
+                f"- Balance     : {format_money_amount(charge_plan['balance_before'])} Tk\n"
+                f"- Current Due : {format_money_amount(charge_plan['due_before'])} Tk\n"
+                f"- Due Limit   : {format_money_amount(charge_plan['due_limit'])} Tk\n"
+                f"- Need More   : {format_money_amount(charge_plan['shortage'])} Tk"
             )
             return
 
         codes = pop_branch_stock_entries(owner_user_id, category, quantity)
         if len(codes) != quantity:
-            await reply_via_branch_owner(event, owner_user_id, "âŒ Could not reserve the requested stock. Please try again.")
+            await reply_via_branch_owner(event, owner_user_id, "❌ Could not reserve the requested stock. Please try again.")
             return
 
         apply_charge_plan(finance, charge_plan)
@@ -2924,26 +3098,26 @@ async def purchase_uc_with_due(event, owner_user_id: int, target_user_id: int, c
     buyer_name = profile.get('name') or (f"@{profile['username']}" if profile.get('username') else str(target_user_id))
     code_lines = []
     for index, item in enumerate(codes, start=1):
-        number_emoji = f"{index}ï¸âƒ£" if index <= 9 else f"{index}."
+        number_emoji = f"{index}."
         full_code = f"{item['code_head']} {item['code_tail']}"
         code_lines.append(f"{number_emoji} `{full_code}`")
 
     await reply_via_branch_owner(
         event,
         owner_user_id,
-        "âœ… ð——ð˜‚ð—² ð—¢ð—¿ð—±ð—²ð—¿ ð—¦ð˜‚ð—°ð—°ð—²ð˜€ð˜€ð—³ð˜‚ð—¹\n\n"
-        f"ðŸ‘¤ Buyer        : {buyer_name}\n"
-        f"ðŸ“¦ Product      : {category} UC\n"
-        f"ðŸ”¢ Quantity     : {quantity}\n"
-        f"ðŸ’¸ Price        : {format_money_amount(total_price)} Tk\n"
-        f"ðŸ’³ Balance Used : {format_money_amount(charge_plan['use_balance'])} Tk\n"
-        f"ðŸ§¾ Due Used     : {format_money_amount(charge_plan['use_due'])} Tk\n"
-        f"ðŸ’° Balance Left : {format_money_amount(charge_plan['balance_after'])} Tk\n"
-        f"ðŸ§¾ Total Due    : {format_money_amount(charge_plan['due_after'])} Tk\n\n"
-        "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n"
-        "ðŸ”‘ Codes:\n\n"
+        "✅ UC Order Successful\n\n"
+        f"Buyer        : {buyer_name}\n"
+        f"Product      : {category} UC\n"
+        f"Quantity     : {quantity}\n"
+        f"Price        : {format_money_amount(total_price)} Tk\n"
+        f"Balance Used : {format_money_amount(charge_plan['use_balance'])} Tk\n"
+        f"Due Used     : {format_money_amount(charge_plan['use_due'])} Tk\n"
+        f"Balance Left : {format_money_amount(charge_plan['balance_after'])} Tk\n"
+        f"Total Due    : {format_money_amount(charge_plan['due_after'])} Tk\n\n"
+        "------------------------------\n"
+        "Codes:\n\n"
         + "\n\n".join(code_lines)
-        + "\nâ”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”"
+        + "\n------------------------------"
     )
 
 
@@ -2956,13 +3130,13 @@ async def topup_with_uc_codes(event, owner_user_id: int, target_user_id: int, ui
     processing_msg = await reply_via_branch_owner(
         event,
         owner_user_id,
-        f"â³ Processing {product_label} topup...\n"
+        f"Processing {product_label} topup...\n"
         f"UID: `{uid}`\n"
         f"Quantity: `{quantity}`"
     )
 
     if quantity <= 0 or quantity > 5:
-        await processing_msg.edit("âŒ Quantity must be between 1 and 5.")
+        await processing_msg.edit("❌ Quantity must be between 1 and 5.")
         return
 
     async with STATE_LOCK:
@@ -2971,16 +3145,16 @@ async def topup_with_uc_codes(event, owner_user_id: int, target_user_id: int, ui
         available_stock = counts.get(category, 0)
         if available_stock < quantity:
             await processing_msg.edit(
-                f"âŒ Not enough stock.\n"
-                f"âžª Category : {category} UC\n"
-                f"âžª Need     : {quantity}\n"
-                f"âžª Stock    : {available_stock}"
+                f"❌ Not enough stock.\n"
+                f"- Category : {category} UC\n"
+                f"- Need     : {quantity}\n"
+                f"- Stock    : {available_stock}"
             )
             return
 
         unit_price = get_branch_rate(owner_user_id, category)
         if unit_price <= 0:
-            await processing_msg.edit(f"âŒ Rate for `{category} UC` is not set.")
+            await processing_msg.edit(f"❌ Rate for `{category} UC` is not set.")
             return
 
         finance = USER_FINANCE[target_user_id]
@@ -2988,18 +3162,18 @@ async def topup_with_uc_codes(event, owner_user_id: int, target_user_id: int, ui
         charge_plan = build_charge_plan(finance, total_price)
         if charge_plan['shortage'] > 0:
             await processing_msg.edit(
-                "âŒ Not enough balance / due limit.\n"
-                f"âžª Total Price : {format_money_amount(total_price)} Tk\n"
-                f"âžª Balance     : {format_money_amount(charge_plan['balance_before'])} Tk\n"
-                f"âžª Current Due : {format_money_amount(charge_plan['due_before'])} Tk\n"
-                f"âžª Due Limit   : {format_money_amount(charge_plan['due_limit'])} Tk\n"
-                f"âžª Need More   : {format_money_amount(charge_plan['shortage'])} Tk"
+                "❌ Not enough balance / due limit.\n"
+                f"- Total Price : {format_money_amount(total_price)} Tk\n"
+                f"- Balance     : {format_money_amount(charge_plan['balance_before'])} Tk\n"
+                f"- Current Due : {format_money_amount(charge_plan['due_before'])} Tk\n"
+                f"- Due Limit   : {format_money_amount(charge_plan['due_limit'])} Tk\n"
+                f"- Need More   : {format_money_amount(charge_plan['shortage'])} Tk"
             )
             return
 
         reserved_entries, reserved_tokens = reserve_branch_stock_entries(owner_user_id, category, quantity)
         if len(reserved_entries) != quantity:
-            await processing_msg.edit("âŒ Could not reserve the requested stock. Please try again.")
+            await processing_msg.edit("❌ Could not reserve the requested stock. Please try again.")
             return
 
         order_id = next_topup_order_id()
@@ -3012,7 +3186,7 @@ async def topup_with_uc_codes(event, owner_user_id: int, target_user_id: int, ui
         async with STATE_LOCK:
             restore_branch_stock_tokens(owner_user_id, category, reserved_tokens)
             save_state()
-        await processing_msg.edit(f"âŒ Topup API failed.\nError: `{error_message or 'Unknown error'}`")
+        await processing_msg.edit(f"❌ Topup API failed.\nError: `{error_message or 'Unknown error'}`")
         return
 
     batch = response_json.get('batch') or []
@@ -3045,34 +3219,33 @@ async def topup_with_uc_codes(event, owner_user_id: int, target_user_id: int, ui
         batch_lines.append(f"{item['code']}  {item['detail']}")
 
     if len(success_entries) == quantity and quantity > 0:
-        status_header = f"âœ… {product_label} ðŸ’Ž TOPUP DONE"
-        status_footer = "âœ… à¦†à¦ªà¦¨à¦¾à¦° Top-Up à¦¸à¦®à§à¦ªà¦¨à§à¦¨ à¦¹à¦¯à¦¼à§‡à¦›à§‡ ðŸŽ‰"
+        status_header = f"✅ {product_label} TOPUP DONE"
+        status_footer = "✅ Top-up completed successfully."
     elif len(success_entries) > 0:
-        status_header = f"âš ï¸ {product_label} ðŸ’Ž TOPUP PARTIAL"
-        status_footer = "âš ï¸ à¦†à¦ªà¦¨à¦¾à¦° Top-Up à¦†à¦‚à¦¶à¦¿à¦• à¦¸à¦®à§à¦ªà¦¨à§à¦¨ à¦¹à¦¯à¦¼à§‡à¦›à§‡"
+        status_header = f"⚠️ {product_label} TOPUP PARTIAL"
+        status_footer = "⚠️ Top-up partially completed."
     else:
-        status_header = f"âŒ {product_label} ðŸ’Ž TOPUP FAILED"
-        status_footer = "âŒ à¦†à¦ªà¦¨à¦¾à¦° Top-Up à¦¸à¦®à§à¦ªà¦¨à§à¦¨ à¦¹à§Ÿà¦¨à¦¿"
+        status_header = f"❌ {product_label} TOPUP FAILED"
+        status_footer = "❌ Top-up failed."
 
     final_message = (
         f"{status_header}\n"
-        "â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”\n"
-        f"â”‚ Order ID : #{order_id}\n"
-        f"â”‚ User     : {username}\n"
-        f"â”‚ UID      : {uid}\n"
-        "â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜\n"
+        "------------------------------\n"
+        f"Order ID : #{order_id}\n"
+        f"User     : {username}\n"
+        f"UID      : {uid}\n"
+        "------------------------------\n"
         + ("\n".join(batch_lines) if batch_lines else "No batch details returned.")
-        + "\nâ”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”\n"
-        f"â”‚ Charge : {format_money_amount(charged_total)} à§³ ({format_money_amount(fee_per_unit)}à§³ Fee/Unit)\n"
-        "â”‚\n"
-        f"â”‚ {product_label}  : {len(success_entries)}x\n"
-        f"â”‚ Failed : {len(failed_entries)}x\n"
-        f"â”‚ Balance Used : {format_money_amount(charge_plan['use_balance'])}à§³ \n"
-        f"â”‚ Due Used     : {format_money_amount(charge_plan['use_due'])}à§³ \n"
-        f"â”‚ Balance Left : {format_money_amount(balance_left)}à§³ \n"
-        f"â”‚ Total Due    : {format_money_amount(total_due)}à§³ \n"
-        f"â”‚ Duration : {duration:.2f}s\n"
-        "â””â”€â”€ ðŸ¤– Powered by TelegonBot â”€â”€â”€â”˜\n\n"
+        + "\n------------------------------\n"
+        f"Charge       : {format_money_amount(charged_total)} Tk ({format_money_amount(fee_per_unit)} Tk Fee/Unit)\n"
+        f"{product_label:<13}: {len(success_entries)}x\n"
+        f"Failed       : {len(failed_entries)}x\n"
+        f"Balance Used : {format_money_amount(charge_plan['use_balance'])} Tk\n"
+        f"Due Used     : {format_money_amount(charge_plan['use_due'])} Tk\n"
+        f"Balance Left : {format_money_amount(balance_left)} Tk\n"
+        f"Total Due    : {format_money_amount(total_due)} Tk\n"
+        f"Duration     : {duration:.2f}s\n"
+        "------------------------------\n\n"
         f"{status_footer}"
     )
     try:
@@ -3393,12 +3566,45 @@ async def remove_super_admin_for_user(event, target_user_id: int):
     SUPER_ADMIN_BRANCH_STATES.pop(target_user_id, None)
     SUPER_ADMIN_USERS.discard(target_user_id)
     SUPER_ADMIN_LIMITS.pop(target_user_id, None)
+    SUPER_ADMIN_ACCESS.pop(target_user_id, None)
     SUPER_ADMIN_CREDENTIALS.pop(target_user_id, None)
     PENDING_SUPER_ADMINS.pop(target_user_id, None)
     save_state()
     await event.reply(
         f"âœ… Super admin `{target_user_id}` removed.\n"
         "Their isolated branch data was left untouched in their own MongoDB."
+    )
+
+
+async def grant_super_admin_access(event, target_user_id: int, days: int):
+    """Grant or extend a verified super admin's system access."""
+    if target_user_id not in SUPER_ADMIN_USERS or target_user_id not in SUPER_ADMIN_CREDENTIALS:
+        await event.reply("❌ Access can only be granted to an already verified super admin.")
+        return
+
+    if days <= 0:
+        await event.reply("❌ Days must be greater than `0`.")
+        return
+
+    owner_user_id, _ = await get_sender_identity(event)
+    now = _utc_now()
+    _, current_expires_at = get_super_admin_access_status(target_user_id)
+    base_time = current_expires_at if current_expires_at and current_expires_at > now else now
+    new_expires_at = base_time + timedelta(days=days)
+
+    SUPER_ADMIN_ACCESS[target_user_id] = {
+        'granted_by': owner_user_id,
+        'granted_days': int(days),
+        'granted_at': now.isoformat(),
+        'expires_at': new_expires_at.isoformat(),
+    }
+    save_state()
+
+    await event.reply(
+        f"✅ Super admin access granted for `{days}` day(s).\n"
+        f"👤 Super Admin: `{get_super_admin_label(target_user_id)}`\n"
+        f"📅 Granted At: `{_format_utc_datetime(now)}`\n"
+        f"⏰ Expires At: `{_format_utc_datetime(new_expires_at)}`"
     )
 
 
@@ -3626,6 +3832,9 @@ async def like_command_handler(event):
     like_type = int(match.group(2))
     actor_user_id, _ = await get_sender_identity(event)
 
+    if not await ensure_branch_system_access(event, "like"):
+        return
+
     if get_user_limit(actor_user_id, like_type) <= 0:
         await event.reply(
             f"❌ আপনার `{like_type}` like package limit set করা নেই.\n\n"
@@ -3768,6 +3977,8 @@ async def help_command_handler(event):
 
 **Owner Commands**
 `setsuperadmin @username`
+`grant @username <days>`
+`grantlist`
 `setlimit <n> <100|200>`
 `setlimit <n> @username <100|200>`
 `removesuperadmin @username`
@@ -4192,6 +4403,65 @@ async def setlimit_command_handler(event):
     await set_limit_for_user(event, target_user_id, limit, like_type)
 
 
+@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?grant\s+(\S+)\s+(\d+)$'))
+async def grant_command_handler(event):
+    """Grant time-limited system access to a verified super admin."""
+    await log_access_check(event, "grant")
+    if not await is_owner(event):
+        await event.reply(await build_access_denied_message(event, "Owner", "grant"))
+        return
+
+    text = event.raw_text.strip()
+    match = re.match(r'(?i)^/?grant\s+(\S+)\s+(\d+)$', text)
+    if not match:
+        await event.reply("❌ Invalid format.\nUsage: `/grant @username 30`")
+        return
+
+    target_text = match.group(1).strip()
+    days = int(match.group(2))
+    active_client = get_event_client(event)
+
+    if re.fullmatch(r'\d+', target_text):
+        target_user_id = int(target_text)
+    else:
+        try:
+            entity = await active_client.get_entity(target_text)
+            cache_entity_profile(entity)
+            save_state()
+            target_user_id = entity.id
+        except Exception as e:
+            await event.reply(f"❌ Could not find user `{target_text}`\nError: `{e}`")
+            return
+
+    await grant_super_admin_access(event, target_user_id, days)
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?grantlist$'))
+async def grantlist_command_handler(event):
+    """Show owner-facing grant status for every verified super admin."""
+    await log_access_check(event, "grantlist")
+    if not await is_owner(event):
+        await event.reply(await build_access_denied_message(event, "Owner", "grantlist"))
+        return
+
+    super_admin_ids = sorted(
+        user_id for user_id in SUPER_ADMIN_USERS
+        if user_id in SUPER_ADMIN_CREDENTIALS
+    )
+    if not super_admin_ids:
+        await event.reply("❌ No verified super admin found.")
+        return
+
+    lines = [
+        "🔐 **Super Admin Grant List**",
+        "",
+    ]
+    for user_id in super_admin_ids:
+        lines.append(build_super_admin_access_summary(user_id))
+
+    await event.reply("\n".join(lines))
+
+
 @client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^/?setsplimit\s+(\d+)\s+(@?\w+)\s+(100|200)$'))
 async def setsplimit_command_handler(event):
     """
@@ -4335,12 +4605,16 @@ async def myaccess_command_handler(event):
     branch_actor_user_id = resolve_branch_actor_user_id(sender_id, sender_username)
     owner = await is_owner(event)
     super_admin = await is_super_admin(event)
+    super_admin_identity = await has_super_admin_identity(event)
     admin = await is_admin(event)
+    branch_access_owner_id, branch_access_text = describe_branch_access_for_user(branch_actor_user_id)
 
     if owner:
         role = "Owner"
     elif super_admin:
         role = "Super Admin"
+    elif super_admin_identity:
+        role = "Super Admin (Inactive)"
     elif admin:
         role = "Admin"
     else:
@@ -4353,6 +4627,8 @@ async def myaccess_command_handler(event):
         f"🛡 Role: `{role}`\n"
         f"👤 Branch ID: `{branch_actor_user_id or 'N/A'}`\n"
         f"👤 Manager ID: `{get_manager_id(branch_actor_user_id) or 'N/A'}`\n"
+        f"👤 Super Admin Branch: `{branch_access_owner_id or 'N/A'}`\n"
+        f"⚙️ Branch Access: `{branch_access_text}`\n"
         f"🔑 Prefix: `{get_manager_prefix(branch_actor_user_id) or 'Not set'}`"
     )
 
@@ -4757,6 +5033,9 @@ async def prefix_command_handler(event):
         await send_prefixed_access_card(event, prefix, prefix_owner_id, int(sender_id), sender_username)
         return
 
+    if action != "help" and not await ensure_branch_system_access(event, action, prefix_owner_id):
+        return
+
     if action == "signup":
         if not user_owns_exact_prefix(int(branch_actor_user_id), prefix):
             await event.reply("❌ This prefix is not owned by your account.")
@@ -5019,6 +5298,8 @@ HANDLER_SPECS = [
     (setsuperadmin_command_handler, r'(?i)^/?setsuperadmin\s+(@?\w+)$'),
     (removesuperadmin_command_handler, r'(?i)^/?removesuperadmin\s+(@?\w+)$'),
     (superauth_command_handler, SUPERAUTH_PATTERN),
+    (grant_command_handler, r'(?i)^/?grant\s+(\S+)\s+(\d+)$'),
+    (grantlist_command_handler, r'(?i)^/?grantlist$'),
     (setsplimit_command_handler, r'(?i)^/?setsplimit\s+(\d+)\s+(@?\w+)\s+(100|200)$'),
     (setlimit_command_handler, r'(?i)^/?setlimit\s+(\d+)(?:\s+(@?\w+))?\s+(100|200)$'),
     (resetlimit_command_handler, r'(?i)^/?resetlimit(?:\s+(@?\w+))?$'),
