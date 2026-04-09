@@ -5806,6 +5806,685 @@ async def main():
     await asyncio.gather(*disconnect_tasks)
 
 
+async def build_access_denied_message(event, required_role: str, command_name: str) -> str:
+    """Build a detailed permission error for easier debugging."""
+    sender_id, sender_username = await get_sender_identity(event)
+    role = await get_access_role(event)
+
+    return (
+        f"Error: `{command_name}` is not available for this account.\n\n"
+        f"Required Role: `{required_role}`\n"
+        f"Detected Role: `{role}`\n"
+        f"Sender ID: `{sender_id}`\n"
+        f"Username: `{('@' + sender_username) if sender_username else 'N/A'}`\n\n"
+        "If this should be a managed admin account, run `myaccess` first."
+    )
+
+
+async def start_super_admin_verification(event, target_user_id: int):
+    """Start an owner-only super admin invitation flow."""
+    owner_user_id, _ = await get_sender_identity(event)
+    if target_user_id == owner_user_id:
+        await event.reply("Error: You cannot invite yourself as a super admin.")
+        return
+
+    if target_user_id in SUPER_ADMIN_USERS:
+        await event.reply(f"Error: User `{target_user_id}` is already a super admin.")
+        return
+
+    PENDING_SUPER_ADMINS[target_user_id] = owner_user_id
+    SUPER_ADMIN_LIMITS.setdefault(target_user_id, {like_type: 0 for like_type in LIKE_TYPES})
+    save_state()
+    await event.reply(
+        f"Super admin request started for user `{target_user_id}`.\n"
+        "Now that user must send:\n"
+        "`superauth <api_id> <api_hash> <session_string> <mongodb_url>`"
+    )
+
+
+async def approve_super_admin(event, api_id: int, api_hash: str, session_string: str, mongodb_uri: str):
+    """Verify a pending super admin and attach their isolated MongoDB."""
+    user_id, sender_username = await get_sender_identity(event)
+    if is_known_super_admin_identity(user_id, sender_username):
+        await event.reply("You are already a super admin.")
+        return
+
+    if user_id not in PENDING_SUPER_ADMINS:
+        await event.reply("Error: No pending super admin request was found for you.")
+        return
+
+    ok, error_message, me = await validate_super_admin_credentials(api_id, api_hash, session_string)
+    if not ok:
+        await event.reply(f"Error: Super admin verification failed.\nError: `{error_message}`")
+        return
+
+    try:
+        init_super_admin_storage(user_id, mongodb_uri)
+        with branch_state_scope(user_id):
+            branch_state = get_branch_state(user_id)
+            branch_state.owner_user_id = user_id
+            load_branch_state(user_id)
+            branch_state.owner_user_id = user_id
+    except Exception as e:
+        await event.reply(f"Error: Super admin MongoDB connection failed.\nError: `{e}`")
+        return
+
+    SUPER_ADMIN_USERS.add(user_id)
+    SUPER_ADMIN_LIMITS.setdefault(user_id, {like_type: 0 for like_type in LIKE_TYPES})
+    SUPER_ADMIN_CREDENTIALS[user_id] = {
+        'api_id': api_id,
+        'api_hash': api_hash,
+        'session_string': session_string,
+        'mongodb_uri': mongodb_uri,
+        'verified_account_id': getattr(me, 'id', None),
+        'verified_account_username': getattr(me, 'username', None),
+    }
+    PENDING_SUPER_ADMINS.pop(user_id, None)
+    save_state()
+
+    verified_label = f"@{me.username}" if getattr(me, 'username', None) else str(getattr(me, 'id', 'N/A'))
+    await start_super_admin_clients()
+    await event.reply(
+        "Super admin verification successful.\n"
+        f"Verified account: `{verified_label}`\n"
+        "Your branch is now running from your own MongoDB."
+    )
+
+
+async def remove_super_admin_for_user(event, target_user_id: int):
+    """Remove a super admin without touching their isolated branch data."""
+    owner_user_id, _ = await get_sender_identity(event)
+    if target_user_id == owner_user_id:
+        await event.reply("Error: You cannot remove the main owner.")
+        return
+
+    if (
+        target_user_id not in SUPER_ADMIN_USERS
+        and target_user_id not in SUPER_ADMIN_CREDENTIALS
+        and target_user_id not in PENDING_SUPER_ADMINS
+    ):
+        await event.reply(f"Error: User `{target_user_id}` is not a super admin.")
+        return
+
+    super_client = SUPER_ADMIN_CLIENTS.pop(target_user_id, None)
+    if super_client is not None:
+        try:
+            await super_client.disconnect()
+        except Exception:
+            pass
+        CLIENT_BRANCH_OWNER_IDS.pop(id(super_client), None)
+
+    mongo_client_for_super = SUPER_ADMIN_MONGO_CLIENTS.pop(target_user_id, None)
+    if mongo_client_for_super is not None:
+        try:
+            mongo_client_for_super.close()
+        except Exception:
+            pass
+
+    SUPER_ADMIN_STATE_COLLECTIONS.pop(target_user_id, None)
+    SUPER_ADMIN_BRANCH_STATES.pop(target_user_id, None)
+    SUPER_ADMIN_USERS.discard(target_user_id)
+    SUPER_ADMIN_LIMITS.pop(target_user_id, None)
+    SUPER_ADMIN_ACCESS.pop(target_user_id, None)
+    SUPER_ADMIN_CREDENTIALS.pop(target_user_id, None)
+    PENDING_SUPER_ADMINS.pop(target_user_id, None)
+    save_state()
+    await event.reply(
+        f"Super admin `{target_user_id}` removed.\n"
+        "Their isolated branch data was left untouched in their own MongoDB."
+    )
+
+
+async def grant_super_admin_access(event, target_user_id: int, days: int):
+    """Grant or extend a verified super admin's system access."""
+    if target_user_id not in SUPER_ADMIN_USERS or target_user_id not in SUPER_ADMIN_CREDENTIALS:
+        await event.reply("Error: Access can only be granted to an already verified super admin.")
+        return
+
+    if days <= 0:
+        await event.reply("Error: Days must be greater than `0`.")
+        return
+
+    owner_user_id, _ = await get_sender_identity(event)
+    now = _utc_now()
+    _, current_expires_at = get_super_admin_access_status(target_user_id)
+    base_time = current_expires_at if current_expires_at and current_expires_at > now else now
+    new_expires_at = base_time + timedelta(days=days)
+
+    SUPER_ADMIN_ACCESS[target_user_id] = {
+        'granted_by': owner_user_id,
+        'granted_days': int(days),
+        'granted_at': now.isoformat(),
+        'expires_at': new_expires_at.isoformat(),
+    }
+    save_state()
+
+    await event.reply(
+        f"Super admin access granted for `{days}` day(s).\n"
+        f"Super Admin: `{get_super_admin_label(target_user_id)}`\n"
+        f"Granted At: `{_format_utc_datetime(now)}`\n"
+        f"Expires At: `{_format_utc_datetime(new_expires_at)}`"
+    )
+
+
+async def check_limit(event, like_type: int) -> bool:
+    """Check whether the active sender still has quota this month."""
+    user_id, _ = await get_sender_identity(event)
+    key = _usage_key(user_id, like_type)
+
+    if await is_admin(event):
+        limit = get_available_self_usage_limit(user_id, like_type)
+    else:
+        limit = get_user_limit(user_id, like_type)
+
+    count = USER_USAGE.get(key, 0)
+    if count >= limit:
+        await event.reply(
+            f"Warning: This month's limit is finished.\n\n"
+            f"User ID: `{user_id}`\n"
+            f"Month: `{_this_month_str()}`\n"
+            f"Like Type: `{like_type}`\n"
+            f"Monthly limit: `{limit}` request(s)"
+        )
+        return False
+    return True
+
+
+async def set_limit_for_user(event, target_user_id: int, limit: int, like_type: int):
+    """Set owner-branch or superadmin-branch limits under the isolated model."""
+    actor_user_id, actor_username = await get_sender_identity(event)
+    actor_branch_user_id = resolve_branch_actor_user_id(actor_user_id, actor_username)
+    actor_is_owner = await is_owner(event)
+
+    if target_user_id in SUPER_ADMIN_USERS:
+        if not actor_is_owner:
+            await event.reply("Error: Only the owner can set a super admin's limit.")
+            return
+
+        super_limits = SUPER_ADMIN_LIMITS.setdefault(target_user_id, {})
+        super_limits[like_type] = limit
+        save_state()
+        await event.reply(
+            f"Monthly limit set to `{limit}` for user `{target_user_id}`.\n"
+            f"Like type: `{like_type}`\n"
+            "This is one shared pool for both self use and distribution."
+        )
+        return
+
+    if actor_is_owner:
+        existing_manager_id = get_manager_id(target_user_id)
+        if target_user_id != actor_branch_user_id and existing_manager_id not in {None, actor_branch_user_id}:
+            await event.reply(
+                f"Error: User `{target_user_id}` already belongs to manager `{existing_manager_id}`."
+            )
+            return
+        if target_user_id != actor_branch_user_id and existing_manager_id is None:
+            set_manager_for_user(target_user_id, actor_branch_user_id)
+    else:
+        if target_user_id == actor_branch_user_id:
+            await event.reply("Error: You cannot set your own limit. The owner controls your top-level limit.")
+            return
+
+        if not await can_manage_target_user(event, target_user_id):
+            if get_manager_id(target_user_id) is not None:
+                await event.reply("Error: You can only set limit for users inside your own branch.")
+                return
+
+        used_by_others = get_direct_child_limit_sum(actor_branch_user_id, like_type, exclude_user_id=target_user_id)
+        parent_limit = get_user_limit(actor_branch_user_id, like_type)
+        parent_used = get_user_used_count(actor_branch_user_id, like_type)
+        if used_by_others + parent_used + limit > parent_limit:
+            remaining = max(parent_limit - used_by_others - parent_used, 0)
+            await event.reply(
+                f"Error: Not enough distributable limit.\n"
+                f"Like type: `{like_type}`\n"
+                f"Your total limit: `{parent_limit}`\n"
+                f"Remaining distributable: `{remaining}`"
+            )
+            return
+
+        existing_manager_id = get_manager_id(target_user_id)
+        if existing_manager_id is not None and existing_manager_id != actor_branch_user_id:
+            await event.reply(
+                f"Error: User `{target_user_id}` already belongs to manager `{existing_manager_id}`."
+            )
+            return
+
+        if existing_manager_id is None:
+            set_manager_for_user(target_user_id, actor_branch_user_id)
+
+    user_limits = USER_LIMITS.setdefault(target_user_id, {})
+    user_limits[like_type] = limit
+    save_state()
+    await event.reply(
+        f"Monthly limit set to `{limit}` for user `{target_user_id}`.\n"
+        f"Like type: `{like_type}`"
+    )
+
+
+async def register_user_under_manager(event, target_user_id: int):
+    """Attach a regular user to the current branch, excluding super admins."""
+    actor_user_id, _ = await get_sender_identity(event)
+
+    if target_user_id == actor_user_id:
+        await event.reply("Error: You cannot register yourself with signup.")
+        return
+
+    if target_user_id in SUPER_ADMIN_USERS:
+        await event.reply("Error: Super admins stay isolated and cannot be signed up into another branch.")
+        return
+
+    existing_manager_id = get_manager_id(target_user_id)
+    if existing_manager_id == actor_user_id:
+        await event.reply(f"Info: User `{target_user_id}` is already registered under your branch.")
+        return
+
+    if existing_manager_id is not None and existing_manager_id != actor_user_id:
+        await event.reply(
+            f"Error: User `{target_user_id}` already belongs to manager `{existing_manager_id}`."
+        )
+        return
+
+    async with STATE_LOCK:
+        set_manager_for_user(target_user_id, actor_user_id)
+        ensure_user_finance_record(target_user_id)
+        save_state()
+    await event.reply(
+        "Signup successful.\n\n"
+        f"User ID: `{target_user_id}`\n"
+        f"Manager ID: `{actor_user_id}`"
+    )
+
+
+async def start_super_admin_clients():
+    """Start dedicated Telegram clients backed by each super admin's own MongoDB."""
+    for user_id, creds in SUPER_ADMIN_CREDENTIALS.items():
+        api_id = creds.get('api_id')
+        api_hash = creds.get('api_hash')
+        session_string = creds.get('session_string')
+        mongodb_uri = creds.get('mongodb_uri')
+
+        if not api_id or not api_hash or not session_string or not mongodb_uri:
+            print(f"Warning: Skipping super admin {user_id}: incomplete credentials or MongoDB URI")
+            continue
+
+        if user_id in SUPER_ADMIN_CLIENTS:
+            continue
+
+        try:
+            init_super_admin_storage(user_id, mongodb_uri)
+            with branch_state_scope(user_id):
+                branch_state = get_branch_state(user_id)
+                branch_state.owner_user_id = user_id
+                load_branch_state(user_id)
+                branch_state.owner_user_id = user_id
+
+            super_client = TelegramClient(StringSession(session_string), int(api_id), api_hash)
+            register_handlers(super_client)
+            await super_client.start()
+
+            me = await super_client.get_me()
+            SUPER_ADMIN_CLIENTS[user_id] = super_client
+            CLIENT_BRANCH_OWNER_IDS[id(super_client)] = user_id
+            print(
+                f"Super admin client started: user_id={user_id} "
+                f"account_id={getattr(me, 'id', 'N/A')} "
+                f"username={getattr(me, 'username', 'N/A')}"
+            )
+        except Exception as e:
+            print(f"Warning: Failed to start super admin client for {user_id}: {e}")
+
+
+async def build_dashboard_payload() -> dict:
+    """Build an owner dashboard payload with per-branch monitoring details."""
+    me = await MAIN_CLIENT.get_me()
+    owner_id = me.id
+    month = _this_month_str()
+    branch_owner_ids = sorted(user_id for user_id in SUPER_ADMIN_USERS if user_id in SUPER_ADMIN_CREDENTIALS)
+    label_cache: dict[int, dict] = {}
+
+    async def resolve_dashboard_label(user_id: int, preferred_owner_id: int | None = None) -> dict:
+        if user_id in label_cache:
+            return label_cache[user_id]
+
+        scopes = [preferred_owner_id]
+        if preferred_owner_id is not None:
+            scopes.append(None)
+
+        for scope_owner_id in scopes:
+            state = get_branch_state(scope_owner_id)
+            profile = state.user_profiles.get(user_id, {})
+            username = str(profile.get('username', '')).strip().lstrip('@')
+            name = str(profile.get('name', '')).strip()
+            if username or name:
+                label = {
+                    'id': user_id,
+                    'username': f"@{username}" if username else '',
+                    'name': name or (f"@{username}" if username else str(user_id)),
+                }
+                label_cache[user_id] = label
+                return label
+
+        creds = SUPER_ADMIN_CREDENTIALS.get(user_id, {})
+        verified_username = str(creds.get('verified_account_username', '')).strip().lstrip('@')
+        if verified_username:
+            label = {
+                'id': user_id,
+                'username': f"@{verified_username}",
+                'name': f"@{verified_username}",
+            }
+            label_cache[user_id] = label
+            return label
+
+        try:
+            entity = await MAIN_CLIENT.get_entity(user_id)
+            cache_entity_profile(entity)
+            username = getattr(entity, 'username', None)
+            first = getattr(entity, 'first_name', '') or ''
+            last = getattr(entity, 'last_name', '') or ''
+            full_name = (first + ' ' + last).strip()
+            label = {
+                'id': user_id,
+                'username': f"@{username}" if username else '',
+                'name': full_name or (f"@{username}" if username else str(user_id)),
+            }
+        except Exception:
+            label = {
+                'id': user_id,
+                'username': '',
+                'name': str(user_id),
+            }
+
+        label_cache[user_id] = label
+        return label
+
+    def get_branch_children(branch_state: BranchState, manager_user_id: int) -> list[int]:
+        return sorted(
+            user_id
+            for user_id, parent_id in branch_state.user_managers.items()
+            if parent_id == manager_user_id
+        )
+
+    def get_branch_usage(branch_state: BranchState, user_id: int, like_type: int) -> int:
+        return int(branch_state.user_usage.get((user_id, month, like_type), 0))
+
+    def get_branch_limit(branch_state: BranchState, user_id: int, like_type: int, branch_owner_id: int | None) -> int:
+        if branch_owner_id is not None and user_id == branch_owner_id:
+            return int(SUPER_ADMIN_LIMITS.get(user_id, {}).get(like_type, DEFAULT_MONTHLY_LIMIT))
+        return int(branch_state.user_limits.get(user_id, {}).get(like_type, DEFAULT_MONTHLY_LIMIT))
+
+    def get_branch_direct_limit_sum(branch_state: BranchState, manager_user_id: int, like_type: int, branch_owner_id: int | None) -> int:
+        return sum(
+            get_branch_limit(branch_state, child_user_id, like_type, branch_owner_id)
+            for child_user_id in get_branch_children(branch_state, manager_user_id)
+        )
+
+    async def build_branch_user_summary(branch_state: BranchState, user_id: int, branch_owner_id: int | None) -> dict:
+        label = await resolve_dashboard_label(user_id, branch_owner_id)
+        role = get_role_name_for_user(user_id, owner_id)
+        limit100 = get_branch_limit(branch_state, user_id, 100, branch_owner_id)
+        limit200 = get_branch_limit(branch_state, user_id, 200, branch_owner_id)
+        used100 = get_branch_usage(branch_state, user_id, 100)
+        used200 = get_branch_usage(branch_state, user_id, 200)
+        distributed100 = get_branch_direct_limit_sum(branch_state, user_id, 100, branch_owner_id)
+        distributed200 = get_branch_direct_limit_sum(branch_state, user_id, 200, branch_owner_id)
+
+        return {
+            'id': user_id,
+            'username': label.get('username', ''),
+            'name': label.get('name', str(user_id)),
+            'role': role,
+            'managerId': branch_state.user_managers.get(user_id),
+            'limit100': limit100,
+            'used100': used100,
+            'remaining100': max(limit100 - used100, 0),
+            'limit200': limit200,
+            'used200': used200,
+            'remaining200': max(limit200 - used200, 0),
+            'distributed100': distributed100,
+            'distributed200': distributed200,
+            'distributable100': max(limit100 - used100 - distributed100, 0),
+            'distributable200': max(limit200 - used200 - distributed200, 0),
+            'availableSelf100': max(limit100 - distributed100, 0),
+            'availableSelf200': max(limit200 - distributed200, 0),
+        }
+
+    owner_state = get_branch_state(None)
+    combined_activity = []
+    total_admins = 0
+    total_users = 0
+    super_admin_cards = []
+
+    for branch_owner_id in branch_owner_ids:
+        branch_state = get_branch_state(branch_owner_id)
+        branch_state.owner_user_id = branch_owner_id
+        branch_label = await resolve_dashboard_label(branch_owner_id, branch_owner_id)
+        direct_children = get_branch_children(branch_state, branch_owner_id)
+        admin_ids = [
+            child_user_id
+            for child_user_id in direct_children
+            if child_user_id in ADMIN_USERS and child_user_id not in SUPER_ADMIN_USERS
+        ]
+        direct_user_ids = [
+            child_user_id
+            for child_user_id in direct_children
+            if child_user_id not in ADMIN_USERS and child_user_id not in SUPER_ADMIN_USERS
+        ]
+
+        admins = []
+        nested_user_count = 0
+        for admin_user_id in admin_ids:
+            admin_summary = await build_branch_user_summary(branch_state, admin_user_id, branch_owner_id)
+            admin_summary['users'] = [
+                await build_branch_user_summary(branch_state, child_user_id, branch_owner_id)
+                for child_user_id in get_branch_children(branch_state, admin_user_id)
+                if child_user_id not in ADMIN_USERS and child_user_id not in SUPER_ADMIN_USERS
+            ]
+            nested_user_count += len(admin_summary['users'])
+            admins.append(admin_summary)
+
+        direct_users = [
+            await build_branch_user_summary(branch_state, child_user_id, branch_owner_id)
+            for child_user_id in direct_user_ids
+        ]
+
+        card = await build_branch_user_summary(branch_state, branch_owner_id, branch_owner_id)
+        status, expires_at = get_super_admin_access_status(branch_owner_id)
+        access_record = get_super_admin_access_record(branch_owner_id)
+        branch_activity = [item for item in branch_state.request_activity if item.get('month') == month]
+        branch_activity.sort(key=lambda item: str(item.get('at', '')), reverse=True)
+        last_activity_at = branch_activity[0].get('at', '') if branch_activity else ''
+        total_branch_users = len(direct_users) + nested_user_count
+
+        card.update({
+            'accessStatus': status,
+            'accessGrantedAt': _format_utc_datetime(_parse_utc_datetime(access_record.get('granted_at'))),
+            'accessExpiresAt': _format_utc_datetime(expires_at),
+            'accessText': (
+                f"Active until {_format_utc_datetime(expires_at)}"
+                if status == 'active' and expires_at is not None
+                else f"Expired on {_format_utc_datetime(expires_at)}"
+                if status == 'expired' and expires_at is not None
+                else "No owner grant"
+            ),
+            'clientOnline': branch_owner_id in SUPER_ADMIN_CLIENTS,
+            'branchStorageReady': branch_owner_id in SUPER_ADMIN_STATE_COLLECTIONS,
+            'requestCount': len(branch_activity),
+            'lastActivityAt': last_activity_at,
+            'adminCount': len(admins),
+            'userCount': total_branch_users,
+            'admins': admins,
+            'directUsers': direct_users,
+            'name': branch_label.get('name', str(branch_owner_id)),
+            'username': branch_label.get('username', ''),
+        })
+        super_admin_cards.append(card)
+        total_admins += len(admins)
+        total_users += total_branch_users
+
+        for item in branch_activity:
+            actor_id = int(item.get('actor_id', 0) or 0)
+            manager_id = item.get('manager_id')
+            actor_label = await resolve_dashboard_label(actor_id, branch_owner_id) if actor_id else {'name': 'Unknown', 'username': ''}
+            manager_label = (
+                await resolve_dashboard_label(int(manager_id), branch_owner_id)
+                if manager_id is not None
+                else branch_label
+            )
+            combined_activity.append({
+                'at': item.get('at', ''),
+                'actor': item.get('actor_name') or actor_label.get('name', str(actor_id or 'Unknown')),
+                'actorRole': item.get('actor_role') or get_role_name_for_user(actor_id, owner_id),
+                'manager': manager_label.get('name', branch_label.get('name', 'Main Admin')),
+                'uid': item.get('uid', ''),
+                'packageType': int(item.get('packageType', 0) or 0),
+                'likesAdded': int(item.get('likesAdded', 0) or 0),
+                'branchOwner': branch_label.get('name', str(branch_owner_id)),
+                'branchOwnerId': branch_owner_id,
+                'branchOwnerUsername': branch_label.get('username', ''),
+                'accessStatus': status,
+            })
+
+    owner_activity = [item for item in owner_state.request_activity if item.get('month') == month]
+    owner_activity.sort(key=lambda item: str(item.get('at', '')), reverse=True)
+    for item in owner_activity:
+        actor_id = int(item.get('actor_id', 0) or 0)
+        manager_id = item.get('manager_id')
+        actor_label = await resolve_dashboard_label(actor_id, None) if actor_id else {'name': 'Unknown', 'username': ''}
+        manager_label = (
+            await resolve_dashboard_label(int(manager_id), None)
+            if manager_id is not None
+            else {'name': 'Main Admin'}
+        )
+        combined_activity.append({
+            'at': item.get('at', ''),
+            'actor': item.get('actor_name') or actor_label.get('name', str(actor_id or 'Unknown')),
+            'actorRole': item.get('actor_role') or get_role_name_for_user(actor_id, owner_id),
+            'manager': manager_label.get('name', 'Main Admin'),
+            'uid': item.get('uid', ''),
+            'packageType': int(item.get('packageType', 0) or 0),
+            'likesAdded': int(item.get('likesAdded', 0) or 0),
+            'branchOwner': 'Main Admin',
+            'branchOwnerId': owner_id,
+            'branchOwnerUsername': '',
+            'accessStatus': 'owner',
+        })
+
+    combined_activity.sort(key=lambda item: str(item.get('at', '')), reverse=True)
+    recent_activity = combined_activity[:80]
+    total_request_count = len(combined_activity)
+
+    return {
+        'generatedAt': _utc_timestamp_str(),
+        'month': month,
+        'summary': {
+            'totalSuperAdmins': len(super_admin_cards),
+            'activeSuperAdmins': sum(1 for item in super_admin_cards if item.get('accessStatus') == 'active'),
+            'expiredSuperAdmins': sum(1 for item in super_admin_cards if item.get('accessStatus') == 'expired'),
+            'inactiveSuperAdmins': sum(1 for item in super_admin_cards if item.get('accessStatus') == 'missing'),
+            'onlineSuperAdmins': sum(1 for item in super_admin_cards if item.get('clientOnline')),
+            'totalAdmins': total_admins,
+            'totalUsers': total_users,
+            'totalUidRequests': total_request_count,
+            'totalDistributed100': sum(item.get('distributed100', 0) for item in super_admin_cards),
+            'totalDistributed200': sum(item.get('distributed200', 0) for item in super_admin_cards),
+            'totalUsed100': sum(item.get('used100', 0) for item in super_admin_cards),
+            'totalUsed200': sum(item.get('used200', 0) for item in super_admin_cards),
+        },
+        'superAdmins': super_admin_cards,
+        'recentActivity': recent_activity,
+    }
+
+
+async def main():
+    """Main function to start the bot and the built-in dashboard web server."""
+    global MAIN_BRANCH_OWNER_ID
+
+    print("Starting Free Fire Like Bot...")
+    init_uc_calc_db()
+    init_mongodb()
+    load_state()
+
+    await MAIN_CLIENT.start()
+
+    if not SESSION_STRING:
+        if not await MAIN_CLIENT.is_user_authorized():
+            print("Please authorize this session:")
+            phone = input("Enter your phone number: ")
+            await MAIN_CLIENT.send_code_request(phone)
+
+            try:
+                code = input("Enter the code you received: ")
+                await MAIN_CLIENT.sign_in(phone, code)
+            except SessionPasswordNeededError:
+                password = input("Enter your 2FA password: ")
+                await MAIN_CLIENT.sign_in(password=password)
+
+    owner = await MAIN_CLIENT.get_me()
+    MAIN_BRANCH_OWNER_ID = owner.id
+    MAIN_BRANCH_STATE.owner_user_id = owner.id
+    CLIENT_BRANCH_OWNER_IDS[id(MAIN_CLIENT)] = None
+
+    print(
+        f"Loaded owner branch with {len(get_direct_children(owner.id))} managed user(s) "
+        f"and {len(SUPER_ADMIN_USERS)} super admin(s)"
+    )
+
+    await start_super_admin_clients()
+
+    async def health(request):
+        return web.Response(text="OK")
+
+    async def dashboard_index(request):
+        index_path = DASHBOARD_DIR / "index.html"
+        if not index_path.exists():
+            return web.Response(
+                text="Dashboard file not found. Expected index.html in project root.",
+                status=404,
+            )
+        return web.FileResponse(index_path)
+
+    async def dashboard_asset(request):
+        allowed_files = {"style.css", "app.js"}
+        filename = request.match_info["filename"]
+        if filename not in allowed_files:
+            raise web.HTTPNotFound(text="Asset not found.")
+
+        asset_path = DASHBOARD_DIR / filename
+        if not asset_path.exists():
+            raise web.HTTPNotFound(text=f"Missing asset: {filename}")
+
+        return web.FileResponse(asset_path)
+
+    async def dashboard_api(request):
+        payload = await build_dashboard_payload()
+        return web.json_response(payload)
+
+    app = web.Application()
+    app.router.add_get("/", dashboard_index)
+    app.router.add_get(r"/{filename:style\.css|app\.js}", dashboard_asset)
+    app.router.add_get("/api/dashboard", dashboard_api)
+    app.router.add_get("/health", health)
+
+    port = int(os.getenv("PORT", 8000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    print(f"HTTP server running on port {port}")
+    print(f"Dashboard: http://127.0.0.1:{port}/")
+    print("Bot is running! Send /start to begin.")
+    print("Press Ctrl+C to stop.")
+
+    disconnect_tasks = [MAIN_CLIENT.run_until_disconnected()]
+    disconnect_tasks.extend(
+        super_client.run_until_disconnected()
+        for super_client in SUPER_ADMIN_CLIENTS.values()
+    )
+    await asyncio.gather(*disconnect_tasks)
+
+
 if __name__ == '__main__':
     try:
         asyncio.run(main())

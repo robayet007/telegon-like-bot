@@ -16,7 +16,7 @@
         <div class="brand-mark">FF</div>
         <div>
           <p class="eyebrow">Control Room</p>
-          <h1>Like Bot Dashboard</h1>
+          <h1>Owner Dashboard</h1>
         </div>
       </div>
 
@@ -24,8 +24,8 @@
         <p class="sidebar-label">Data Source</p>
         <button id="load-demo-btn" class="button button-secondary" type="button">Load Demo Data</button>
         <label class="upload-card" for="json-file-input">
-          <span>Import Sanitized JSON</span>
-          <small>Only safe dashboard export, not raw bot session data.</small>
+          <span>Import Dashboard JSON</span>
+          <small>Use sanitized exports only. Do not upload raw session or auth files.</small>
         </label>
         <input id="json-file-input" type="file" accept=".json,application/json" hidden>
       </div>
@@ -33,17 +33,15 @@
       <div class="sidebar-block">
         <p class="sidebar-label">Quick Info</p>
         <ul class="sidebar-list" id="quick-info-list">
-          <li>Static dashboard ready</li>
-          <li>Safe import supported</li>
-          <li>Live API hook ready</li>
+          <li>Loading dashboard data</li>
         </ul>
       </div>
 
       <div class="sidebar-block tip-card">
-        <p class="sidebar-label">Important</p>
+        <p class="sidebar-label">What You Can See</p>
         <p>
-          Do not expose raw <code>bot_state.json</code> in public hosting.
-          It contains sensitive authentication data.
+          Access status, request activity, branch usage, limit distribution,
+          online client state, and direct admin or user counts for each super admin.
         </p>
       </div>
     </aside>
@@ -57,7 +55,7 @@
         <div class="topbar-actions">
           <div class="status-pill">
             <span class="status-dot"></span>
-            <span id="data-status-text">Demo mode</span>
+            <span id="data-status-text">Loading</span>
           </div>
           <button id="clear-storage-btn" class="button button-ghost" type="button">Reset Saved Data</button>
         </div>
@@ -66,10 +64,11 @@
       <section class="hero-panel">
         <div>
           <p class="eyebrow">Main Admin View</p>
-          <h3>Monitor super admins, limits, users, and UID activity in one place</h3>
+          <h3>See which super admins are active, who has access, and how branch limits are being used</h3>
           <p class="hero-copy">
-            This dashboard is designed for the main admin to see how much limit each super admin has,
-            how much they distributed, who their users are, and which UIDs received like requests.
+            This dashboard is built for fast owner review. You can track access expiry,
+            online state, request volume, branch growth, and recent UID activity without
+            opening the bot logs.
           </p>
         </div>
         <div class="hero-meta">
@@ -86,17 +85,55 @@
 
       <section class="stats-grid" id="stats-grid"></section>
 
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <p class="eyebrow">Super Admin Monitor</p>
+            <h3>Access, requests, and branch health</h3>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Super Admin</th>
+                <th>Access</th>
+                <th>Client</th>
+                <th>Requests</th>
+                <th>100 Package</th>
+                <th>200 Package</th>
+                <th>Branch Size</th>
+                <th>Last Activity</th>
+              </tr>
+            </thead>
+            <tbody id="super-admin-table-body"></tbody>
+          </table>
+        </div>
+      </section>
+
       <section class="content-grid">
         <article class="panel panel-wide">
           <div class="panel-header">
             <div>
-              <p class="eyebrow">Super Admins</p>
-              <h3>Distribution health</h3>
+              <p class="eyebrow">Branch Cards</p>
+              <h3>Detailed super admin snapshots</h3>
             </div>
           </div>
           <div id="super-admin-cards" class="super-admin-grid"></div>
         </article>
 
+        <article class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Activity Feed</p>
+              <h3>Latest UID requests</h3>
+            </div>
+          </div>
+          <div id="activity-list" class="activity-list"></div>
+        </article>
+      </section>
+
+      <section class="content-grid">
         <article class="panel">
           <div class="panel-header">
             <div>
@@ -106,17 +143,15 @@
           </div>
           <div id="hierarchy-tree" class="hierarchy-tree"></div>
         </article>
-      </section>
 
-      <section class="content-grid">
         <article class="panel panel-wide">
           <div class="panel-header">
             <div>
-              <p class="eyebrow">All Managed Users</p>
-              <h3>Users, limits, usage, manager</h3>
+              <p class="eyebrow">Managed Users</p>
+              <h3>Search every branch user quickly</h3>
             </div>
             <label class="search-field">
-              <input id="user-search-input" type="search" placeholder="Search user, username, manager...">
+              <input id="user-search-input" type="search" placeholder="Search user, username, manager, role">
             </label>
           </div>
           <div class="table-wrap">
@@ -126,25 +161,14 @@
                   <th>User</th>
                   <th>Role</th>
                   <th>Manager</th>
-                  <th>100 Limit</th>
-                  <th>100 Used</th>
-                  <th>200 Limit</th>
-                  <th>200 Used</th>
+                  <th>100</th>
+                  <th>200</th>
+                  <th>Branch</th>
                 </tr>
               </thead>
               <tbody id="users-table-body"></tbody>
             </table>
           </div>
-        </article>
-
-        <article class="panel">
-          <div class="panel-header">
-            <div>
-              <p class="eyebrow">UID Activity</p>
-              <h3>Recent like requests</h3>
-            </div>
-          </div>
-          <div id="activity-list" class="activity-list"></div>
         </article>
       </section>
     </main>
