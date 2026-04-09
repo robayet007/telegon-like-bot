@@ -1321,15 +1321,26 @@ def get_user_limit(user_id: int, like_type: int) -> int:
 
 def get_manager_id(user_id: int) -> int | None:
     """Return direct manager id for a user if assigned."""
-    return USER_MANAGERS.get(user_id)
+    normalized_user_id = normalize_branch_identity_user_id(user_id)
+    if normalized_user_id is None:
+        return None
+
+    manager_user_id = USER_MANAGERS.get(normalized_user_id)
+    if manager_user_id is None and normalized_user_id != user_id:
+        manager_user_id = USER_MANAGERS.get(user_id)
+    return normalize_branch_identity_user_id(manager_user_id)
 
 
 def set_manager_for_user(target_user_id: int, manager_user_id: int | None):
     """Assign or clear a user's direct manager."""
+    normalized_target_user_id = normalize_branch_identity_user_id(target_user_id)
+    if normalized_target_user_id is None:
+        return
+
     if manager_user_id is None:
-        USER_MANAGERS.pop(target_user_id, None)
+        USER_MANAGERS.pop(normalized_target_user_id, None)
     else:
-        USER_MANAGERS[target_user_id] = manager_user_id
+        USER_MANAGERS[normalized_target_user_id] = normalize_branch_identity_user_id(manager_user_id)
 
 
 def _utc_now() -> datetime:
@@ -1373,14 +1384,76 @@ def get_super_admin_label(user_id: int) -> str:
     return str(user_id)
 
 
+def resolve_super_admin_record_user_id(user_id: int | None = None, username: str | None = None) -> int | None:
+    """Resolve a stored super-admin branch owner id from any known identity."""
+    if user_id is not None and user_id in SUPER_ADMIN_CREDENTIALS:
+        return int(user_id)
+
+    if user_id is not None:
+        for stored_user_id, creds in SUPER_ADMIN_CREDENTIALS.items():
+            verified_account_id = creds.get('verified_account_id')
+            if verified_account_id is not None and int(verified_account_id) == int(user_id):
+                return int(stored_user_id)
+
+    normalized_username = str(username or '').strip().lstrip('@').lower()
+    if normalized_username:
+        for stored_user_id, creds in SUPER_ADMIN_CREDENTIALS.items():
+            verified_username = str(creds.get('verified_account_username') or '').strip().lstrip('@').lower()
+            if verified_username and verified_username == normalized_username:
+                return int(stored_user_id)
+
+    if user_id is not None and user_id in SUPER_ADMIN_USERS:
+        return int(user_id)
+
+    return None
+
+
+def normalize_branch_identity_user_id(user_id: int | None) -> int | None:
+    """Collapse verified super-admin identities onto the stored branch owner id."""
+    if user_id is None:
+        return None
+
+    try:
+        normalized_user_id = int(user_id)
+    except (TypeError, ValueError):
+        return None
+
+    resolved_super_admin_user_id = resolve_super_admin_record_user_id(user_id=normalized_user_id)
+    if resolved_super_admin_user_id is not None:
+        return int(resolved_super_admin_user_id)
+    return normalized_user_id
+
+
+def is_owner_user_id(user_id: int | None) -> bool:
+    """Return True when a user id belongs to the main owner branch."""
+    normalized_user_id = normalize_branch_identity_user_id(user_id)
+    if normalized_user_id is None:
+        return False
+
+    known_owner_ids = {
+        owner_id
+        for owner_id in (MAIN_BRANCH_OWNER_ID, MAIN_BRANCH_STATE.owner_user_id)
+        if owner_id is not None
+    }
+    return normalized_user_id in known_owner_ids
+
+
 def get_super_admin_branch_owner_id(user_id: int | None) -> int | None:
     """Return the nearest super admin in a user's manager chain."""
-    current_user_id = user_id
+    normalized_user_id = normalize_branch_identity_user_id(user_id)
+    if normalized_user_id is None or is_owner_user_id(normalized_user_id):
+        return None
+
+    current_user_id = normalized_user_id
     visited = set()
 
     while current_user_id is not None and current_user_id not in visited:
-        if current_user_id in SUPER_ADMIN_USERS:
-            return current_user_id
+        current_user_id = normalize_branch_identity_user_id(current_user_id)
+        if current_user_id is None or is_owner_user_id(current_user_id):
+            return None
+        resolved_super_admin_user_id = resolve_super_admin_record_user_id(user_id=current_user_id)
+        if resolved_super_admin_user_id is not None:
+            return int(resolved_super_admin_user_id)
         visited.add(current_user_id)
         current_user_id = get_manager_id(current_user_id)
 
@@ -1389,8 +1462,24 @@ def get_super_admin_branch_owner_id(user_id: int | None) -> int | None:
 
 def get_super_admin_access_record(user_id: int) -> dict:
     """Return a normalized access record for one super admin."""
-    record = SUPER_ADMIN_ACCESS.get(user_id, {})
-    return record if isinstance(record, dict) else {}
+    lookup_user_ids = []
+    stored_user_id = resolve_super_admin_record_user_id(user_id=user_id)
+
+    if stored_user_id is not None:
+        lookup_user_ids.append(int(stored_user_id))
+        creds = SUPER_ADMIN_CREDENTIALS.get(int(stored_user_id), {})
+        verified_account_id = creds.get('verified_account_id')
+        if verified_account_id is not None:
+            lookup_user_ids.append(int(verified_account_id))
+
+    lookup_user_ids.append(int(user_id))
+
+    for lookup_user_id in lookup_user_ids:
+        record = SUPER_ADMIN_ACCESS.get(lookup_user_id, {})
+        if isinstance(record, dict) and record:
+            return record
+
+    return {}
 
 
 def get_super_admin_access_status(user_id: int) -> tuple[str, datetime | None]:
@@ -1425,6 +1514,14 @@ def describe_branch_access_for_user(user_id: int | None) -> tuple[int | None, st
 
 def build_super_admin_access_denied_message(super_admin_user_id: int, command_name: str) -> str:
     """Explain why a branch command is blocked for an inactive super admin branch."""
+    normalized_super_admin_user_id = normalize_branch_identity_user_id(super_admin_user_id)
+    if normalized_super_admin_user_id is None or is_owner_user_id(normalized_super_admin_user_id):
+        return (
+            f"❌ `{command_name}` is only blocked when a super admin branch has no active owner grant.\n\n"
+            "Owner branch does not need `grant` access."
+        )
+
+    super_admin_user_id = normalized_super_admin_user_id
     status, expires_at = get_super_admin_access_status(super_admin_user_id)
     status_text = "No active grant"
     date_line = ""
@@ -1470,7 +1567,13 @@ def build_super_admin_access_summary(user_id: int) -> str:
 
 def get_manager_prefix(user_id: int) -> str | None:
     """Return stored signup prefix for an owner/super admin."""
-    prefix = MANAGER_PREFIXES.get(user_id)
+    normalized_user_id = normalize_branch_identity_user_id(user_id)
+    if normalized_user_id is None:
+        return None
+
+    prefix = MANAGER_PREFIXES.get(normalized_user_id)
+    if not prefix and normalized_user_id != user_id:
+        prefix = MANAGER_PREFIXES.get(user_id)
     if not prefix:
         return None
     return str(prefix)
@@ -1478,7 +1581,10 @@ def get_manager_prefix(user_id: int) -> str | None:
 
 def set_manager_prefix(user_id: int, prefix: str):
     """Persist a single-character signup prefix for an owner/super admin."""
-    MANAGER_PREFIXES[user_id] = prefix
+    normalized_user_id = normalize_branch_identity_user_id(user_id)
+    if normalized_user_id is None:
+        return
+    MANAGER_PREFIXES[normalized_user_id] = prefix
 
 
 def _sanitize_money_value(value) -> str:
@@ -1920,10 +2026,14 @@ def build_rate_list_message(owner_user_id: int) -> str:
 
 def get_direct_children(manager_user_id: int) -> set[int]:
     """Return direct child users managed by a specific account."""
+    normalized_manager_user_id = normalize_branch_identity_user_id(manager_user_id)
+    if normalized_manager_user_id is None:
+        return set()
+
     return {
-        user_id
+        normalize_branch_identity_user_id(user_id)
         for user_id, parent_id in USER_MANAGERS.items()
-        if parent_id == manager_user_id
+        if normalize_branch_identity_user_id(parent_id) == normalized_manager_user_id
     }
 
 
@@ -2230,7 +2340,17 @@ async def get_access_role(event) -> str:
 async def ensure_branch_system_access(event, command_name: str, branch_owner_id: int | None = None) -> bool:
     """Block branch operations when their super admin has no active owner grant."""
     actor_user_id, _ = await get_sender_identity(event)
-    super_admin_user_id = branch_owner_id or get_super_admin_branch_owner_id(actor_user_id)
+    raw_sender_id = getattr(event, 'sender_id', None)
+    normalized_branch_owner_id = normalize_branch_identity_user_id(branch_owner_id)
+
+    if (
+        is_owner_user_id(actor_user_id)
+        or is_owner_user_id(raw_sender_id)
+        or is_owner_user_id(normalized_branch_owner_id)
+    ):
+        return True
+
+    super_admin_user_id = normalized_branch_owner_id or get_super_admin_branch_owner_id(actor_user_id)
     if super_admin_user_id is None or has_active_super_admin_access(super_admin_user_id):
         return True
 
@@ -5894,6 +6014,10 @@ async def approve_super_admin(event, api_id: int, api_hash: str, session_string:
 async def remove_super_admin_for_user(event, target_user_id: int):
     """Remove a super admin without touching their isolated branch data."""
     owner_user_id, _ = await get_sender_identity(event)
+    normalized_target_user_id = resolve_super_admin_record_user_id(user_id=target_user_id)
+    if normalized_target_user_id is not None:
+        target_user_id = normalized_target_user_id
+
     if target_user_id == owner_user_id:
         await event.reply("Error: You cannot remove the main owner.")
         return
@@ -5937,6 +6061,10 @@ async def remove_super_admin_for_user(event, target_user_id: int):
 
 async def grant_super_admin_access(event, target_user_id: int, days: int):
     """Grant or extend a verified super admin's system access."""
+    normalized_target_user_id = resolve_super_admin_record_user_id(user_id=target_user_id)
+    if normalized_target_user_id is not None:
+        target_user_id = normalized_target_user_id
+
     if target_user_id not in SUPER_ADMIN_USERS or target_user_id not in SUPER_ADMIN_CREDENTIALS:
         await event.reply("Error: Access can only be granted to an already verified super admin.")
         return
@@ -5995,6 +6123,10 @@ async def set_limit_for_user(event, target_user_id: int, limit: int, like_type: 
     actor_user_id, actor_username = await get_sender_identity(event)
     actor_branch_user_id = resolve_branch_actor_user_id(actor_user_id, actor_username)
     actor_is_owner = await is_owner(event)
+    normalized_super_admin_user_id = resolve_super_admin_record_user_id(user_id=target_user_id)
+
+    if normalized_super_admin_user_id is not None:
+        target_user_id = normalized_super_admin_user_id
 
     if target_user_id in SUPER_ADMIN_USERS:
         if not actor_is_owner:
@@ -6403,7 +6535,6 @@ async def main():
     print("Starting Free Fire Like Bot...")
     init_uc_calc_db()
     init_mongodb()
-    load_state()
 
     await MAIN_CLIENT.start()
 
@@ -6424,6 +6555,8 @@ async def main():
     MAIN_BRANCH_OWNER_ID = owner.id
     MAIN_BRANCH_STATE.owner_user_id = owner.id
     CLIENT_BRANCH_OWNER_IDS[id(MAIN_CLIENT)] = None
+    load_state()
+    MAIN_BRANCH_STATE.owner_user_id = owner.id
 
     print(
         f"Loaded owner branch with {len(get_direct_children(owner.id))} managed user(s) "
