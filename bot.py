@@ -32,6 +32,9 @@ load_dotenv()
 API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
 API_KEY = os.getenv('API_KEY', 'BSMQ9T')  # Default API key
+LIKE_API_200_URL = os.getenv('LIKE_API_200_URL', 'https://reality.mahmud-tech.online/api.php')
+LIKE_API_200_KEY = os.getenv('LIKE_API_200_KEY', '')
+LIKE_API_200_SERVER = os.getenv('LIKE_API_200_SERVER', 'bd')
 SESSION_STRING = os.getenv('SESSION_STRING')
 MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://127.0.0.1:27017')
 MONGODB_DB = os.getenv('MONGODB_DB', 'ff_like_bot')
@@ -3825,9 +3828,9 @@ async def set_limit_for_user(event, target_user_id: int, limit: int, like_type: 
 
 def format_response(data):
     """Format API response into a readable message"""
-    likes_given = data.get('LikesGivenByAPI', 0)
-    likes_before = data.get('LikesbeforeCommand', 0)
-    likes_after = data.get('LikesafterCommand', 0)
+    likes_given = _safe_int(data.get('LikesGivenByAPI', 0))
+    likes_before = _safe_int(data.get('LikesbeforeCommand', 0))
+    likes_after = _safe_int(data.get('LikesafterCommand', 0))
     player_nickname = data.get('PlayerNickname', 'N/A')
     uid = data.get('UID', 'N/A')
 
@@ -3853,15 +3856,48 @@ def format_response(data):
 RESPONSE_FOOTER = "\n━━━━━━━━━━━━━━━━━━━━\n🤖 Powered by Telegon"
 
 
+def _safe_int(value, default: int = 0) -> int:
+    """Convert API values to int without breaking on null/strings."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _api_status_is_success(data: dict) -> bool:
+    """Treat missing status as legacy success, and status=1/true as success."""
+    if 'status' not in data:
+        return True
+    raw_status = data.get('status')
+    if isinstance(raw_status, bool):
+        return raw_status
+    if isinstance(raw_status, str):
+        normalized = raw_status.strip().lower()
+        if normalized in {'1', 'true', 'success', 'ok'}:
+            return True
+        if normalized in {'0', 'false', 'failed', 'error'}:
+            return False
+    return _safe_int(raw_status, default=0) == 1
+
+
+def _extract_api_error_message(data: dict) -> str:
+    """Pick the best available API error message field."""
+    for key in ('message', 'msg', 'error', 'statusMessage'):
+        value = data.get(key)
+        if value:
+            return str(value)
+    return 'API request failed'
+
+
 def get_likes_added(data) -> int:
     """
     Calculate how many likes were actually added for limit logic.
     We use the max of (after - before) and LikesGivenByAPI,
     but DO NOT force non-zero like format_response does.
     """
-    likes_given = data.get('LikesGivenByAPI', 0) or 0
-    likes_before = data.get('LikesbeforeCommand', 0) or 0
-    likes_after = data.get('LikesafterCommand', 0) or 0
+    likes_given = _safe_int(data.get('LikesGivenByAPI', 0))
+    likes_before = _safe_int(data.get('LikesbeforeCommand', 0))
+    likes_after = _safe_int(data.get('LikesafterCommand', 0))
 
     diff = likes_after - likes_before
     added = max(diff, likes_given, 0)
@@ -3871,15 +3907,40 @@ def get_likes_added(data) -> int:
 async def call_ff_api(uid, like_type: int):
     """Make GET request to the selected FF like API."""
     if like_type == 200:
-        url = f"https://free-fire-like-api-bd12.vercel.app/like?uid={uid}&server_name=BD"
+        if not LIKE_API_200_KEY:
+            return {
+                'error': True,
+                'message': 'LIKE_API_200_KEY is not configured in the environment'
+            }
+        url = LIKE_API_200_URL
+        params = {
+            'action': 'like',
+            'uid': uid,
+            'server_name': LIKE_API_200_SERVER,
+            'key': LIKE_API_200_KEY,
+        }
     else:
-        url = f"https://ff.api.emonaxc.com/like?key={API_KEY}&uid={uid}"
+        url = "https://ff.api.emonaxc.com/like"
+        params = {
+            'key': API_KEY,
+            'uid': uid,
+        }
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as response:
                 if response.status == 200:
                     data = await response.json()
+                    if not isinstance(data, dict):
+                        return {
+                            'error': True,
+                            'message': 'Unexpected API response format'
+                        }
+                    if not _api_status_is_success(data):
+                        return {
+                            'error': True,
+                            'message': _extract_api_error_message(data)
+                        }
                     return data
                 else:
                     return {
