@@ -3828,11 +3828,11 @@ async def set_limit_for_user(event, target_user_id: int, limit: int, like_type: 
 
 def format_response(data):
     """Format API response into a readable message"""
-    likes_given = _safe_int(data.get('LikesGivenByAPI', 0))
-    likes_before = _safe_int(data.get('LikesbeforeCommand', 0))
-    likes_after = _safe_int(data.get('LikesafterCommand', 0))
-    player_nickname = data.get('PlayerNickname', 'N/A')
-    uid = data.get('UID', 'N/A')
+    likes_given = _safe_int(_get_first_present(data, 'LikesGivenByAPI', 'LikesGivenbyAPi', default=0))
+    likes_before = _safe_int(_get_first_present(data, 'LikesbeforeCommand', default=0))
+    likes_after = _safe_int(_get_first_present(data, 'LikesafterCommand', default=0))
+    player_nickname = _get_first_present(data, 'PlayerNickname', 'nickname', default='N/A')
+    uid = _get_first_present(data, 'UID', 'uid', default='N/A')
 
     # Calculate total likes added
     total_likes_added = likes_after - likes_before
@@ -3864,6 +3864,14 @@ def _safe_int(value, default: int = 0) -> int:
         return default
 
 
+def _get_first_present(data: dict, *keys, default=None):
+    """Return the first non-null value from known API key variants."""
+    for key in keys:
+        if key in data and data.get(key) is not None:
+            return data.get(key)
+    return default
+
+
 def _api_status_is_success(data: dict) -> bool:
     """Treat missing status as legacy success, and status=1/true as success."""
     if 'status' not in data:
@@ -3878,6 +3886,21 @@ def _api_status_is_success(data: dict) -> bool:
         if normalized in {'0', 'false', 'failed', 'error'}:
             return False
     return _safe_int(raw_status, default=0) == 1
+
+
+def _looks_like_like_result(data: dict) -> bool:
+    """Accept zero-like responses when the API still returns player/result fields."""
+    result_keys = (
+        'UID',
+        'uid',
+        'PlayerNickname',
+        'nickname',
+        'LikesbeforeCommand',
+        'LikesafterCommand',
+        'LikesGivenByAPI',
+        'LikesGivenbyAPi',
+    )
+    return any(key in data for key in result_keys)
 
 
 def _extract_api_error_message(data: dict) -> str:
@@ -3895,9 +3918,9 @@ def get_likes_added(data) -> int:
     We use the max of (after - before) and LikesGivenByAPI,
     but DO NOT force non-zero like format_response does.
     """
-    likes_given = _safe_int(data.get('LikesGivenByAPI', 0))
-    likes_before = _safe_int(data.get('LikesbeforeCommand', 0))
-    likes_after = _safe_int(data.get('LikesafterCommand', 0))
+    likes_given = _safe_int(_get_first_present(data, 'LikesGivenByAPI', 'LikesGivenbyAPi', default=0))
+    likes_before = _safe_int(_get_first_present(data, 'LikesbeforeCommand', default=0))
+    likes_after = _safe_int(_get_first_present(data, 'LikesafterCommand', default=0))
 
     diff = likes_after - likes_before
     added = max(diff, likes_given, 0)
@@ -3937,6 +3960,8 @@ async def call_ff_api(uid, like_type: int):
                             'message': 'Unexpected API response format'
                         }
                     if not _api_status_is_success(data):
+                        if _looks_like_like_result(data):
+                            return data
                         return {
                             'error': True,
                             'message': _extract_api_error_message(data)
