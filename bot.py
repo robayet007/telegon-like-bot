@@ -294,6 +294,7 @@ MAIN_METADATA_DOC_ID = 'main_metadata'
 MAIN_BRANCH_STATE_DOC_ID = 'owner_branch_state'
 BRANCH_STATE_DOC_ID = 'branch_state'
 LEGACY_GLOBAL_STATE_DOC_ID = 'global_state'
+UC_CALC_DOC_ID = 'uc_calc_prices'
 
 
 class CalculatorError(Exception):
@@ -879,6 +880,15 @@ def init_uc_calc_db():
                 )
         conn.commit()
 
+    sqlite_prices = _read_uc_calc_prices_from_sqlite()
+    mongo_prices = _read_uc_calc_prices_from_mongo()
+    merged_prices = _merge_uc_calc_price_maps(sqlite_prices, mongo_prices)
+
+    if merged_prices != sqlite_prices:
+        _write_uc_calc_prices_to_sqlite(merged_prices)
+    if state_collection is not None and merged_prices != mongo_prices:
+        _write_uc_calc_prices_to_mongo(merged_prices)
+
 
 def normalize_uc_calc_item_key(raw_key: str | int) -> str:
     """Normalize calculator item keys like 161, lvl15, or weeklylite."""
@@ -892,6 +902,149 @@ def format_uc_calc_item_label(item_key: str) -> str:
     if item_key.isdigit():
         return f"{item_key} UC"
     return item_key
+
+
+def _parse_uc_calc_updated_at(value) -> datetime:
+    """Parse stored timestamps so the newest UC price wins during sync."""
+    if not value:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _build_uc_calc_price_entry(item_key: str | int, item_label: str | None, price, updated_at=None) -> dict:
+    """Normalize one UC calculator price row into a shared storage format."""
+    normalized_key = normalize_uc_calc_item_key(item_key)
+    return {
+        'item_key': normalized_key,
+        'item_label': item_label or format_uc_calc_item_label(normalized_key),
+        'price': str(price),
+        'updated_at': str(updated_at or datetime.now(timezone.utc).isoformat()),
+    }
+
+
+def _merge_uc_calc_price_maps(*price_maps: dict[str, dict]) -> dict[str, dict]:
+    """Merge local and Mongo UC prices, preferring the newest timestamp."""
+    merged = {}
+    for price_map in price_maps:
+        for item_key, entry in (price_map or {}).items():
+            normalized_entry = _build_uc_calc_price_entry(
+                entry.get('item_key', item_key),
+                entry.get('item_label'),
+                entry.get('price'),
+                entry.get('updated_at'),
+            )
+            existing = merged.get(normalized_entry['item_key'])
+            if existing is None or _parse_uc_calc_updated_at(normalized_entry['updated_at']) >= _parse_uc_calc_updated_at(existing.get('updated_at')):
+                merged[normalized_entry['item_key']] = normalized_entry
+    return merged
+
+
+def _read_uc_calc_prices_from_sqlite() -> dict[str, dict]:
+    """Load all standalone UC calculator prices from the local SQLite fallback."""
+    try:
+        with sqlite3.connect(UC_CALC_DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT item_key, item_label, price, updated_at FROM uc_calc_prices"
+            ).fetchall()
+    except sqlite3.Error:
+        return {}
+
+    return {
+        normalize_uc_calc_item_key(item_key): _build_uc_calc_price_entry(item_key, item_label, price, updated_at)
+        for item_key, item_label, price, updated_at in rows
+    }
+
+
+def _write_uc_calc_prices_to_sqlite(prices: dict[str, dict]):
+    """Write the full UC calculator price set to the local SQLite fallback."""
+    UC_CALC_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(UC_CALC_DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS uc_calc_prices (
+                item_key TEXT PRIMARY KEY,
+                item_label TEXT NOT NULL,
+                price TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("DELETE FROM uc_calc_prices")
+        conn.executemany(
+            """
+            INSERT INTO uc_calc_prices (item_key, item_label, price, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (
+                    entry['item_key'],
+                    entry['item_label'],
+                    entry['price'],
+                    entry['updated_at'],
+                )
+                for entry in prices.values()
+            ],
+        )
+        conn.commit()
+
+
+def _read_uc_calc_prices_from_mongo() -> dict[str, dict]:
+    """Load UC calculator prices from MongoDB when available."""
+    if state_collection is None:
+        return {}
+
+    document = state_collection.find_one({'_id': UC_CALC_DOC_ID}) or {}
+    raw_prices = document.get('prices', {})
+    normalized_prices = {}
+
+    if isinstance(raw_prices, list):
+        iterator = (
+            (entry.get('item_key'), entry)
+            for entry in raw_prices
+            if isinstance(entry, dict) and entry.get('item_key')
+        )
+    else:
+        iterator = (
+            (item_key, entry)
+            for item_key, entry in raw_prices.items()
+            if isinstance(entry, dict)
+        )
+
+    for item_key, entry in iterator:
+        normalized_entry = _build_uc_calc_price_entry(
+            item_key,
+            entry.get('item_label'),
+            entry.get('price'),
+            entry.get('updated_at'),
+        )
+        normalized_prices[normalized_entry['item_key']] = normalized_entry
+
+    return normalized_prices
+
+
+def _write_uc_calc_prices_to_mongo(prices: dict[str, dict]):
+    """Persist UC calculator prices to MongoDB for durable storage."""
+    if state_collection is None:
+        return
+
+    payload = {
+        '_id': UC_CALC_DOC_ID,
+        'prices': {
+            item_key: {
+                'item_label': entry['item_label'],
+                'price': entry['price'],
+                'updated_at': entry['updated_at'],
+            }
+            for item_key, entry in prices.items()
+        },
+    }
+    state_collection.replace_one({'_id': UC_CALC_DOC_ID}, payload, upsert=True)
 
 
 def is_uc_calc_command_text(text: str) -> bool:
@@ -915,60 +1068,49 @@ async def safe_uc_calc_reply(event, message: str):
 def set_uc_calc_price(item_key: str | int, price: Decimal):
     """Save one calculator item price in the standalone calculator database."""
     normalized_key = normalize_uc_calc_item_key(item_key)
-    item_label = format_uc_calc_item_label(normalized_key)
-    with sqlite3.connect(UC_CALC_DB_PATH) as conn:
-        conn.execute(
-            """
-            INSERT INTO uc_calc_prices (item_key, item_label, price, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(item_key) DO UPDATE SET
-                item_label = excluded.item_label,
-                price = excluded.price,
-                updated_at = excluded.updated_at
-            """,
-            (normalized_key, item_label, str(price), datetime.now(timezone.utc).isoformat()),
-        )
-        conn.commit()
+    prices = _merge_uc_calc_price_maps(_read_uc_calc_prices_from_sqlite(), _read_uc_calc_prices_from_mongo())
+    prices[normalized_key] = _build_uc_calc_price_entry(
+        normalized_key,
+        format_uc_calc_item_label(normalized_key),
+        price,
+    )
+    _write_uc_calc_prices_to_sqlite(prices)
+    _write_uc_calc_prices_to_mongo(prices)
 
 
 def delete_uc_calc_price(item_key: str | int) -> bool:
     """Delete one configured calculator item price from the standalone calculator database."""
     normalized_key = normalize_uc_calc_item_key(item_key)
-    with sqlite3.connect(UC_CALC_DB_PATH) as conn:
-        cursor = conn.execute("DELETE FROM uc_calc_prices WHERE item_key = ?", (normalized_key,))
-        conn.commit()
-        return cursor.rowcount > 0
+    prices = _merge_uc_calc_price_maps(_read_uc_calc_prices_from_sqlite(), _read_uc_calc_prices_from_mongo())
+    deleted = prices.pop(normalized_key, None) is not None
+    if deleted:
+        _write_uc_calc_prices_to_sqlite(prices)
+        _write_uc_calc_prices_to_mongo(prices)
+    return deleted
 
 
 def get_uc_calc_price(item_key: str | int) -> Decimal | None:
     """Fetch one calculator item price from the standalone calculator database."""
     normalized_key = normalize_uc_calc_item_key(item_key)
-    with sqlite3.connect(UC_CALC_DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT price FROM uc_calc_prices WHERE item_key = ?",
-            (normalized_key,),
-        ).fetchone()
-
-    if not row:
+    prices = _merge_uc_calc_price_maps(_read_uc_calc_prices_from_sqlite(), _read_uc_calc_prices_from_mongo())
+    entry = prices.get(normalized_key)
+    if not entry:
         return None
 
     try:
-        return Decimal(str(row[0]))
+        return Decimal(str(entry['price']))
     except (InvalidOperation, TypeError):
         return None
 
 
 def list_uc_calc_prices() -> list[tuple[str, str, Decimal]]:
     """Return all configured calculator prices from the standalone calculator database."""
-    with sqlite3.connect(UC_CALC_DB_PATH) as conn:
-        rows = conn.execute(
-            "SELECT item_key, item_label, price FROM uc_calc_prices ORDER BY item_key ASC"
-        ).fetchall()
-
     prices = []
-    for item_key, item_label, price in rows:
+    merged_prices = _merge_uc_calc_price_maps(_read_uc_calc_prices_from_sqlite(), _read_uc_calc_prices_from_mongo())
+    for item_key in sorted(merged_prices):
+        entry = merged_prices[item_key]
         try:
-            prices.append((str(item_key), str(item_label), Decimal(str(price))))
+            prices.append((str(item_key), str(entry['item_label']), Decimal(str(entry['price']))))
         except (InvalidOperation, TypeError, ValueError):
             continue
     return prices
@@ -6619,8 +6761,8 @@ async def main():
     global MAIN_BRANCH_OWNER_ID
 
     print("Starting Free Fire Like Bot...")
-    init_uc_calc_db()
     init_mongodb()
+    init_uc_calc_db()
 
     await MAIN_CLIENT.start()
 
