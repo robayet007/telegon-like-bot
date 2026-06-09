@@ -3972,11 +3972,14 @@ async def set_limit_for_user(event, target_user_id: int, limit: int, like_type: 
 
 def format_response(data):
     """Format API response into a readable message"""
+    personal_data = data.get('personal_data') if isinstance(data.get('personal_data'), dict) else {}
     likes_given = _safe_int(_get_first_present(data, 'LikesGivenByAPI', 'LikesGivenbyAPi', default=0))
     likes_before = _safe_int(_get_first_present(data, 'LikesbeforeCommand', default=0))
     likes_after = _safe_int(_get_first_present(data, 'LikesafterCommand', default=0))
     player_nickname = _get_first_present(data, 'PlayerNickname', 'nickname', default='N/A')
-    uid = _get_first_present(data, 'UID', 'uid', default='N/A')
+    uid = _get_first_present(data, 'UID', 'uid', default=personal_data.get('UID', 'N/A'))
+    player_region = personal_data.get('PlayerRegion')
+    player_level = personal_data.get('PlayerLevel')
 
     # Calculate total likes added
     total_likes_added = likes_after - likes_before
@@ -3988,11 +3991,17 @@ def format_response(data):
 ━━━━━━━━━━━━━━━━━━━━
 👤 Player Nickname: {player_nickname}
 🆔 Player UID: {uid}
-
 👍 Before Likes: {likes_before}
 🔥 After Likes: {likes_after}
 💎 Total Likes Added: {total_likes_added}
 ━━━━━━━━━━━━━━━━━━━━"""
+
+    if player_region:
+        message += f"\n🌍 Region: {player_region}"
+    if player_level is not None:
+        message += f"\n🎖 Level: {player_level}"
+
+    message += "\n━━━━━━━━━━━━━━━━━━━━"
 
     return message
 
@@ -4037,6 +4046,7 @@ def _looks_like_like_result(data: dict) -> bool:
     result_keys = (
         'UID',
         'uid',
+        'personal_data',
         'PlayerNickname',
         'nickname',
         'LikesbeforeCommand',
