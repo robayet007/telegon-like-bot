@@ -31,7 +31,9 @@ load_dotenv()
 # Get credentials from environment
 API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
-API_KEY = os.getenv('API_KEY', 'BSMQ9T')  # Default API key
+LIKE_API_100_URL = 'https://ff.api.emonaxc.com/like'
+LIKE_API_100_KEY = 'SLGJ5E'
+API_KEY = os.getenv('API_KEY', LIKE_API_100_KEY)  # Legacy fallback for non-like uses
 LIKE_API_200_URL = os.getenv('LIKE_API_200_URL', 'https://reality.mahmud-tech.online/api.php')
 LIKE_API_200_KEY = os.getenv('LIKE_API_200_KEY', '')
 LIKE_API_200_SERVER = os.getenv('LIKE_API_200_SERVER', 'bd')
@@ -39,7 +41,7 @@ SESSION_STRING = os.getenv('SESSION_STRING')
 MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://127.0.0.1:27017')
 MONGODB_DB = os.getenv('MONGODB_DB', 'ff_like_bot')
 MONGODB_STATE_COLLECTION = os.getenv('MONGODB_STATE_COLLECTION', 'bot_state')
-STOCK_TOKEN_SECRET = os.getenv('STOCK_TOKEN_SECRET') or f"{API_HASH}:{API_KEY}"
+STOCK_TOKEN_SECRET = os.getenv('STOCK_TOKEN_SECRET') or f"{API_HASH}:{LIKE_API_100_KEY}"
 UCBOT_TOPUP_URL = os.getenv('UCBOT_TOPUP_URL', 'http://api.ucbot.store/topup-sync')
 UCBOT_AUTH_TOKEN = os.getenv('UCBOT_AUTH_TOKEN', '')
 UC_CALC_DB_PATH = Path(os.getenv('UC_CALC_DB_PATH', Path(__file__).resolve().parent / 'uc_calculator.db'))
@@ -4085,9 +4087,9 @@ async def call_ff_api(uid, like_type: int):
             'key': LIKE_API_200_KEY,
         }
     else:
-        url = "https://ff.api.emonaxc.com/like"
+        url = LIKE_API_100_URL
         params = {
-            'key': API_KEY,
+            'key': LIKE_API_100_KEY,
             'uid': uid,
         }
 

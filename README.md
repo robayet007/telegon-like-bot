@@ -16,7 +16,8 @@ A Telegram user bot built with Telethon that sends likes to Free Fire players us
 
 - Python 3.7 or higher
 - Telegram API ID and API Hash (get from [my.telegram.org/apps](https://my.telegram.org/apps))
-- FF API Key (default: BSMQ9T)
+- `100 like` API is hardcoded in the bot code
+- `200 like` API key still comes from environment
 
 ## Installation
 
@@ -33,7 +34,8 @@ A Telegram user bot built with Telethon that sends likes to Free Fire players us
      ```
      API_ID=your_api_id_here
      API_HASH=your_api_hash_here
-     API_KEY=BSMQ9T
+     API_KEY=SLGJ5E
+     LIKE_API_200_KEY=your_200_like_key_here
      ```
 
 ## Usage
@@ -49,15 +51,15 @@ A Telegram user bot built with Telethon that sends likes to Free Fire players us
    - If you have 2FA enabled, enter your password
 
 3. **Using the bot:**
-   - Send `/like <uid>` to give likes to a player
-   - Example: `/like 1711537287`
+   - Send `/like <uid> <100|200>` to give likes to a player
+   - Example: `/like 1711537287 100`
    - The bot will respond with formatted results
 
 ## Commands
 
 - `/start` - Show welcome message
 - `/help` - Show help information
-- `/like <uid>` - Send likes to a Free Fire player (e.g., `/like 1711537287`)
+- `/like <uid> <100|200>` - Send likes to a Free Fire player (e.g., `/like 1711537287 100`)
 
 ## Example Response
 
@@ -80,7 +82,8 @@ A Telegram user bot built with Telethon that sends likes to Free Fire players us
 - This is a **user bot** (not a bot account), so it uses your personal Telegram account
 - The bot will create a session file (`ff_like_bot.session`) for authentication
 - Keep your `.env` file secure and never share it
-- API rate limits apply based on your API key configuration
+- `100 like` always uses the hardcoded `emonaxc` endpoint and key from the codebase
+- `200 like` still depends on your configured environment key
 
 ## Troubleshooting
 
