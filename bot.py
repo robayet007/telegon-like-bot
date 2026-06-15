@@ -1163,21 +1163,43 @@ def parse_uc_calc_items(message_text: str, supported_keys: set[str] | None = Non
             continue
 
         compact_line = normalize_uc_calc_item_key(line)
-        numbers = [int(value) for value in re.findall(r'\d+', line)]
-        if not numbers:
+        if 'total' in compact_line and 'due' in compact_line:
             continue
 
-        quantity = int(numbers[-1])
-        if quantity <= 0:
+        tokens = re.findall(r'[a-z]+|\d+', line)
+        if not tokens:
             continue
 
         matched_key = None
-        for key in sorted(known_keys, key=len, reverse=True):
-            if key and key in compact_line:
-                matched_key = key
+        matched_token_index = -1
+        max_join_tokens = 3
+
+        for index in range(len(tokens)):
+            for token_span in range(max_join_tokens, 0, -1):
+                end_index = index + token_span
+                if end_index > len(tokens):
+                    continue
+                candidate_key = normalize_uc_calc_item_key(''.join(tokens[index:end_index]))
+                if candidate_key in known_keys:
+                    matched_key = candidate_key
+                    matched_token_index = end_index - 1
+                    break
+            if matched_key is not None:
                 break
 
         if matched_key is None:
+            continue
+
+        number_tokens_after_key = [
+            int(token)
+            for token in tokens[matched_token_index + 1:]
+            if token.isdigit()
+        ]
+        if not number_tokens_after_key:
+            continue
+
+        quantity = int(number_tokens_after_key[-1])
+        if quantity <= 0:
             continue
 
         items.append({'item_key': matched_key, 'quantity': quantity})
@@ -2233,6 +2255,14 @@ def get_available_self_usage_limit(user_id: int, like_type: int) -> int:
     own_limit = get_user_limit(user_id, like_type)
     distributed = get_direct_child_limit_sum(user_id, like_type)
     return max(own_limit - distributed, 0)
+
+
+def get_effective_self_usage_limit(user_id: int, like_type: int) -> int:
+    """Return the self-usage cap that should be enforced for one actor."""
+    normalized_user_id = normalize_branch_identity_user_id(user_id)
+    if is_owner_user_id(normalized_user_id):
+        return get_user_limit(normalized_user_id, like_type)
+    return get_available_self_usage_limit(normalized_user_id, like_type)
 
 
 def get_remaining_distributable_limit(manager_user_id: int, like_type: int) -> int:
@@ -3605,10 +3635,10 @@ async def check_limit(event, like_type: int) -> bool:
     user_id, _ = await get_sender_identity(event)
     key = _usage_key(user_id, like_type)
 
-    # For super admins/admins, self-use comes from the same assigned pool
-    # that they also distribute to child users.
+    # Owners keep their own top-level limit. Super admins share one pool
+    # between self-use and whatever they distribute to child users.
     if user_id in ADMIN_USERS or user_id in SUPER_ADMIN_USERS:
-        limit = get_available_self_usage_limit(user_id, like_type)
+        limit = get_effective_self_usage_limit(user_id, like_type)
     else:
         limit = get_user_limit(user_id, like_type)
 
@@ -3881,7 +3911,7 @@ async def check_limit(event, like_type: int) -> bool:
     key = _usage_key(user_id, like_type)
 
     if await is_admin(event):
-        limit = get_available_self_usage_limit(user_id, like_type)
+        limit = get_effective_self_usage_limit(user_id, like_type)
     else:
         limit = get_user_limit(user_id, like_type)
 
@@ -6341,7 +6371,7 @@ async def check_limit(event, like_type: int) -> bool:
     key = _usage_key(user_id, like_type)
 
     if await is_admin(event):
-        limit = get_available_self_usage_limit(user_id, like_type)
+        limit = get_effective_self_usage_limit(user_id, like_type)
     else:
         limit = get_user_limit(user_id, like_type)
 
